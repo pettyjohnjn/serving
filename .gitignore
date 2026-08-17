@@ -1,0 +1,13 @@
+venv2/
+logs/
+etc/keys.env
+etc/keys.env.bak
+etc/vllm-keys.yaml
+etc/endpoint.json
+__pycache__/
+*.pyc
+examples/__pycache__/
+webui-data/
+venv-webui/
+.webui_secret_key
+etc/site.env

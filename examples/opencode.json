@@ -1,0 +1,27 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "globus": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Globus (DGX Spark)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8000/v1",
+        "apiKey": "sk-local"
+      },
+      "models": {
+        "qwen3.8-27b": {
+          "name": "Qwen3.8 27B",
+          "tool_call": true,
+          "reasoning": true,
+          "attachment": true,
+          "limit": {
+            "context": 262144,
+            "output": 32768
+          }
+        }
+      }
+    }
+  },
+  "model": "globus/qwen3.8-27b",
+  "small_model": "globus/qwen3.8-27b"
+}

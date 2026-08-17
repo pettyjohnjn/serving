@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# webui — Open WebUI, the browser chat frontend for the Qwen3.8-27B endpoint.
+#
+#   webui start | stop | restart | status | logs [-f] | ensure
+#
+# Two processes on globus1, managed together:
+#   127.0.0.1:8080       webui-idproxy.py — resolves which cluster account opened
+#                        each tunneled connection (kernel socket ownership) and
+#                        injects trusted-auth headers. No signup, no passwords:
+#                        you are logged in as the user you SSHed in as.
+#   webui-data/webui.sock  open-webui backend on a unix socket (0700 dir), so only
+#                        the operator account and root can reach it directly —
+#                        nobody else can hand it a forged identity header.
+#
+# Users tunnel one extra port next to the API:
+#   ssh -N -L 8080:127.0.0.1:8080 <login-node>   ->  http://localhost:8080
+#
+# `ensure` is for cron: start whichever half is down, quietly.
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+VENV=$ROOT/venv-webui
+DATA=$ROOT/webui-data          # accounts, chat history (sqlite) — git-ignored, 0700
+LOG=$ROOT/logs/webui.log
+PLOG=$ROOT/logs/webui-idproxy.log
+PIDFILE=$ROOT/logs/webui.pid
+PPIDFILE=$ROOT/logs/webui-idproxy.pid
+# The backend listens on a UNIX SOCKET inside the 0700 data dir, not a TCP port.
+# Loopback TCP is host-wide, so any shell account could have sent the backend a
+# forged identity header; a socket under webui-data/ is connectable only by the
+# operator account and root. The identity proxy is the sole way in for everyone else.
+SOCK=$DATA/webui.sock
+PROXY_PORT=8080                # what users tunnel to
+
+alive()  { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
+
+# Three small patches to the installed package, re-applied on every start so a pip
+# upgrade cannot silently revert them (same idea as patch_vllm_gdn_sm120.sh):
+#   1. drop the " (Open WebUI)" suffix env.py forces onto a custom WEBUI_NAME;
+#   2. bump the frontend root font size — the UI is rem-based, so this scales
+#      everything (users can still fine-tune with browser zoom);
+#   3. inject the context ring (bin/webui-ring.js): window usage bottom-right,
+#      hover for numbers, click to compact via the native /compact endpoint.
+patch_branding() {
+    local sp="$VENV/lib/python3.12/site-packages/open_webui"
+    python3 - "$sp" "$ROOT/bin/webui-ring.js" <<'EOF'
+import pathlib, sys
+sp = pathlib.Path(sys.argv[1])
+
+env = sp / "env.py"
+s = env.read_text()
+if "WEBUI_NAME += ' (Open WebUI)'" in s:
+    s = s.replace("WEBUI_NAME += ' (Open WebUI)'",
+                  "pass  # suffix removed by serving/bin/webui")
+    env.write_text(s)
+    print("patched: env.py branding suffix")
+
+idx = sp / "frontend" / "index.html"
+s = idx.read_text()
+if "globus-ui-scale" not in s:
+    s = s.replace("</head>",
+        '<style id="globus-ui-scale">:root{font-size:18px}</style></head>')
+    idx.write_text(s)
+    print("patched: frontend font scale")
+
+ring = pathlib.Path(sys.argv[2]).read_text()
+marker = "globus-context-ring"
+s = idx.read_text()
+block = f'<script id="{marker}">{ring}</script></body>'
+if marker not in s:
+    idx.write_text(s.replace("</body>", block))
+    print("patched: context ring injected")
+else:
+    # re-inject if the widget source changed since last start
+    import re
+    new = re.sub(rf'<script id="{marker}">.*?</script></body>', block,
+                 s, flags=re.S)
+    if new != s:
+        idx.write_text(new)
+        print("patched: context ring updated")
+EOF
+}
+
+start_backend() {
+    alive "$PIDFILE" && return 0
+    mkdir -p "$DATA" && chmod 700 "$DATA"
+    patch_branding
+    # Mirror what `open-webui serve` does before uvicorn (we launch uvicorn directly
+    # because the CLI cannot bind a unix socket): pin the JWT secret key and set the
+    # marker env.
+    export FROM_INIT_PY=true
+    if [ ! -s "$DATA/.webui_secret_key" ]; then
+        umask 077
+        openssl rand -base64 64 | tr -d '\n' > "$DATA/.webui_secret_key"
+    fi
+    WEBUI_SECRET_KEY=$(cat "$DATA/.webui_secret_key")
+    export WEBUI_SECRET_KEY
+    export WEBUI_NAME="Globus Cluster Inference"
+    # Engine/access logs at INFO record every API path a user touches (chat ids,
+    # activity timing). WARNING keeps real problems and drops the activity trail.
+    export GLOBAL_LOG_LEVEL=WARNING
+    # 8005 = the published endpoint directly, around the fairness proxy: browser
+    # chats are interactive and should not queue behind someone's batch sweep.
+    export OPENAI_API_BASE_URL=http://127.0.0.1:8005/v1
+    export OPENAI_API_KEY=sk-local
+    export ENABLE_OLLAMA_API=false
+    export DATA_DIR=$DATA
+    export WEBUI_URL=http://localhost:$PROXY_PORT
+    # Identity comes from the proxy; accounts are auto-created on first visit.
+    export WEBUI_AUTH_TRUSTED_EMAIL_HEADER=X-Globus-Email
+    export WEBUI_AUTH_TRUSTED_NAME_HEADER=X-Globus-Name
+    export DEFAULT_USER_ROLE=user
+    # Without this, a model with no DB row is ADMIN-ONLY ("only admins can see
+    # unconfigured models", utils/models.py) — non-admin users get an empty model
+    # picker. One model, everyone trusted: let every account see every model.
+    export BYPASS_MODEL_ACCESS_CONTROL=true
+    export ENABLE_EVALUATION_ARENA_MODELS=false
+    # No outbound telemetry from a lab box, and no "share to openwebui.com" button —
+    # chats must not be postable to a public community site.
+    export ENABLE_COMMUNITY_SHARING=false
+    export SCARF_NO_ANALYTICS=true DO_NOT_TRACK=true ANONYMIZED_TELEMETRY=false
+    rm -f "$SOCK"
+    # NOTE the cd is a separate statement: in `cd X && nohup CMD &` the & backgrounds
+    # the WHOLE list, so $! would be a wrapper shell, not the server — killing that
+    # wrapper later orphans the real process while its socket stays taken.
+    ( cd "$DATA" || exit 1
+      nohup "$VENV/bin/uvicorn" open_webui.main:app \
+          --uds "$SOCK" --forwarded-allow-ips '*' >> "$LOG" 2>&1 &
+      echo $! > "$PIDFILE" )
+    echo "backend started (pid $(cat "$PIDFILE"), socket $SOCK)"
+}
+
+start_proxy() {
+    alive "$PPIDFILE" && return 0
+    nohup python3 "$ROOT/bin/webui-idproxy.py" >> "$PLOG" 2>&1 &
+    echo $! > "$PPIDFILE"
+    echo "idproxy started (pid $!)"
+}
+
+stop_one() {  # pidfile
+    alive "$1" || { rm -f "$1"; return 0; }
+    kill "$(cat "$1")" 2>/dev/null
+    for _ in $(seq 20); do alive "$1" || break; sleep 1; done
+    alive "$1" && kill -9 "$(cat "$1")" 2>/dev/null
+    rm -f "$1"
+}
+
+# Belt and braces for stop: also clear any process matching the exact launch
+# commands, so an orphan from a stale pidfile can never keep the ports occupied.
+stop_strays() {
+    pkill -f "uvicorn open_webui.main:app --uds $SOCK" 2>/dev/null
+    pkill -f "open-webui serve" 2>/dev/null   # pre-socket layout, in case of leftovers
+    pkill -f "webui-idproxy.py" 2>/dev/null
+    return 0
+}
+
+status() {
+    if alive "$PIDFILE"; then
+        code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' --unix-socket "$SOCK" http://webui/health 2>/dev/null)
+        echo "backend  running (pid $(cat "$PIDFILE")), health: ${code:-000} (unix socket)"
+    else
+        echo "backend  not running"
+    fi
+    if alive "$PPIDFILE"; then
+        echo "idproxy  running (pid $(cat "$PPIDFILE")) on 127.0.0.1:$PROXY_PORT"
+    else
+        echo "idproxy  not running"
+    fi
+}
+
+case "${1:-status}" in
+    start)   start_backend; start_proxy ;;
+    stop)    stop_one "$PPIDFILE"; stop_one "$PIDFILE"; stop_strays; echo "stopped" ;;
+    restart) stop_one "$PPIDFILE"; stop_one "$PIDFILE"; stop_strays; sleep 1; start_backend; start_proxy ;;
+    status)  status ;;
+    logs)    if [ "${2:-}" = "-f" ]; then tail -f "$LOG"; else tail -n "${2:-40}" "$LOG"; fi ;;
+    ensure)  start_backend >/dev/null; start_proxy >/dev/null ;;
+    *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac

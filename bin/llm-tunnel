@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# llm-tunnel — open a local OpenAI-compatible endpoint backed by the Qwen3.8-27B
+# server on the globus cluster. Your SSH key is the credential; there is nothing
+# else to configure.
+#
+#   ./llm-tunnel                 # foreground, auto-reconnects, Ctrl-C to stop
+#   ./llm-tunnel --port 9000     # use a different local port
+#   ./llm-tunnel --user alice    # if your cluster username differs from your local one
+#   ./llm-tunnel --once          # single attempt, no reconnect loop (for scripts/CI)
+#
+# Then point any OpenAI-compatible tool at:  http://localhost:8000/v1
+#
+# Copy this file to your own machine; it does not need to run on the cluster.
+
+set -uo pipefail
+
+LOGIN_HOST=${LLM_LOGIN_HOST:-<login-node>}
+REMOTE_TARGET=${LLM_REMOTE_TARGET:-127.0.0.1:8000}
+LOCAL_PORT=${LLM_LOCAL_PORT:-8000}
+SSH_USER=${LLM_SSH_USER:-$USER}
+ONCE=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --port) LOCAL_PORT="$2"; shift 2 ;;
+        --user) SSH_USER="$2"; shift 2 ;;
+        --host) LOGIN_HOST="$2"; shift 2 ;;
+        --once) ONCE=1; shift ;;
+        -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "unknown option: $1" >&2; exit 2 ;;
+    esac
+done
+
+if command -v lsof >/dev/null 2>&1 && lsof -iTCP:"$LOCAL_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "error: local port $LOCAL_PORT is already in use. Pick another with --port." >&2
+    exit 1
+fi
+
+echo "llm-tunnel: localhost:$LOCAL_PORT  ->  $SSH_USER@$LOGIN_HOST  ->  $REMOTE_TARGET"
+echo "            base_url = http://localhost:$LOCAL_PORT/v1"
+echo "            (Ctrl-C to stop)"
+
+connect() {
+    # ExitOnForwardFailure so we fail loudly instead of pretending to be up.
+    # ServerAlive* makes a dead link get noticed within ~1 minute.
+    ssh -N \
+        -L "${LOCAL_PORT}:${REMOTE_TARGET}" \
+        -o ExitOnForwardFailure=yes \
+        -o ServerAliveInterval=20 \
+        -o ServerAliveCountMax=3 \
+        -o ConnectTimeout=10 \
+        "${SSH_USER}@${LOGIN_HOST}"
+}
+
+if [ "$ONCE" = "1" ]; then connect; exit $?; fi
+
+backoff=2
+while true; do
+    connect
+    rc=$?
+    # 130 = Ctrl-C
+    [ $rc -eq 130 ] && { echo "llm-tunnel: stopped."; exit 0; }
+    echo "llm-tunnel: disconnected (rc=$rc); reconnecting in ${backoff}s..." >&2
+    sleep "$backoff"
+    backoff=$(( backoff < 30 ? backoff * 2 : 30 ))
+done

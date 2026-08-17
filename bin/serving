@@ -1,0 +1,418 @@
+#!/usr/bin/env bash
+# serving — single entrypoint for the Qwen3.8-27B endpoint.
+#
+#   serving start        launch the slurm job (refuses if one is already up)
+#   serving stop         drain in-flight requests, then stop
+#   serving restart      stop, wait for memory to be released, start
+#   serving status       job state, reachability, live load, MTP acceptance
+#   serving logs [-f]    show (or follow) the current job's log
+#   serving test         smoke-test the running endpoint
+#   serving keys         list / add / revoke user API keys
+#   serving doctor       diagnose a broken or unreachable endpoint
+#   serving supervise    restart if down (intended for cron; safe to run often)
+#
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+# Site-specific names (compute node, public login FQDN) live in etc/site.env,
+# which is git-ignored — copy etc/site.env.example and fill it in.
+[ -f "$ROOT/etc/site.env" ] && . "$ROOT/etc/site.env"
+COMPUTE_NODE=${COMPUTE_NODE:-globus3}
+LOGIN_FQDN=${LOGIN_FQDN:-}
+JOB=qwen38-serve
+PORT=8000
+SBATCH_ARGS=(-w "$COMPUTE_NODE" -o "$ROOT/logs/serve-%j.out" -e "$ROOT/logs/serve-%j.out"
+             --export=ALL,SERVING_ROOT="$ROOT")
+KEYS=$ROOT/etc/keys.env
+EP=$ROOT/etc/endpoint.json
+KEEP_LOGS=${KEEP_LOGS:-15}
+DRAIN_WAIT=${DRAIN_WAIT:-280}   # > serve.sh DRAIN_SECONDS(240) so a real drain can finish
+
+c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
+die()  { printf '%serror:%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*"; }
+warn() { printf '%swarn:%s %s\n' "$c_yel" "$c_off" "$*"; }
+
+# cron does NOT reliably export USER. With `set -u` that made every squeue helper fail in its
+# subshell, job_state() came back empty, and supervise concluded "no job" and submitted a
+# duplicate every 5 minutes. Never depend on $USER here.
+ME=$(id -un)
+
+# Prefer a RUNNING job when several exist, so a queued duplicate can never mask the live one.
+job_line()  { squeue -h -u "$ME" -n "$JOB" -o '%T %i %N' 2>/dev/null | sort -r | head -1; }
+job_ids()   { squeue -h -u "$ME" -n "$JOB" -o '%i' 2>/dev/null; }
+job_state() { job_line | awk '{print $1}'; }
+job_id()    { job_line | awk '{print $2}'; }
+job_node()  { job_line | awk '{print $3}'; }
+
+# One lock for ALL lifecycle operations, not just supervise: otherwise the cron can submit a
+# job while a human is mid-restart (observed: jobs 532 and 533 queued during one restart).
+LOCK="$ROOT/logs/.serving.lock"
+take_lock() {  # $1 = "wait" | "nowait"
+    mkdir -p "$ROOT/logs" 2>/dev/null
+    exec 9>"$LOCK" 2>/dev/null || return 0
+    if [ "${1:-wait}" = "nowait" ]; then flock -n 9 2>/dev/null || return 1
+    else flock -w 600 9 2>/dev/null || return 1; fi
+    return 0
+}
+cur_log()   { local j; j=$(job_id); [ -n "$j" ] && echo "$ROOT/logs/serve-$j.out"; }
+first_key() { grep -m1 -E '^KEY_' "$KEYS" 2>/dev/null | cut -d= -f2-; }
+health()    { curl -s -m 8 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health" 2>/dev/null; }
+
+rotate_logs() {
+    local n
+    n=$(ls -1t "$ROOT"/logs/serve-*.out 2>/dev/null | wc -l)
+    [ "$n" -le "$KEEP_LOGS" ] && return 0
+    ls -1t "$ROOT"/logs/serve-*.out 2>/dev/null | tail -n +$((KEEP_LOGS + 1)) | while read -r f; do rm -f "$f"; done
+    info "${c_dim}rotated logs (kept newest $KEEP_LOGS)${c_off}"
+}
+
+wait_ready() {   # $1 = timeout seconds
+    local t=${1:-900} i=0 log
+    log=$(cur_log)
+    printf 'waiting for the model to load '
+    while [ "$i" -lt "$t" ]; do
+        [ "$(health)" = "200" ] && { printf ' %sready%s\n' "$c_grn" "$c_off"; return 0; }
+        [ -z "$(job_state)" ] && { printf ' %sjob exited%s\n' "$c_red" "$c_off"; [ -n "$log" ] && tail -5 "$log"; return 1; }
+        printf '.'; sleep 10; i=$((i + 10))
+    done
+    printf ' %stimed out%s\n' "$c_red" "$c_off"; return 1
+}
+
+# A '#' comment inside the backslash-continued `vllm serve` command ends the logical line and
+# silently drops every flag after it. That once launched vLLM with no arguments at all --
+# losing --host, which exposed the port publicly. Nothing in bash -n catches it, so check here.
+lint_serve_script() {
+    python3 - "$ROOT/bin/serve.sh" <<'PYEOF'
+import re, sys
+lines = open(sys.argv[1]).read().split("\n")
+try:
+    start = next(i for i, l in enumerate(lines) if l.startswith('"$SERVING_ROOT/venv2/bin/vllm" serve'))
+except StopIteration:
+    sys.exit("lint: could not find the vllm serve command")
+i, flags, bad = start, [], []
+while True:
+    l = lines[i]
+    if i > start and l.lstrip().startswith("#"):
+        bad.append(f"  line {i+1}: {l.strip()[:70]}")
+    flags += re.findall(r"--[a-z0-9-]+", l)
+    if not l.rstrip().endswith("\\"):
+        break
+    i += 1
+if bad:
+    sys.exit("lint: comment inside the continued vllm command truncates it:\n" + "\n".join(bad))
+for required in ("--host", "--served-model-name", "--port"):
+    if required not in flags:
+        sys.exit(f"lint: {required} never reaches vllm (command truncated?)")
+PYEOF
+}
+
+cmd_start() {
+    take_lock wait || die "another serving operation is in progress"
+    rm -f "$ROOT/logs/.paused"
+    lint_serve_script || die "refusing to start: serve.sh would launch vllm with missing flags"
+    local st; st=$(job_state)
+    if [ -n "$st" ]; then
+        info "already $st as job $(job_id) on $(job_node); use 'serving restart' to replace it"
+        return 0
+    fi
+    # keys.env is only needed when REQUIRE_API_KEY=1; SSH-only mode needs no secret.
+    rotate_logs
+    local out; out=$(cd "$ROOT" && sbatch "${SBATCH_ARGS[@]}" bin/serve.sh 2>&1) || die "$out"
+    info "$out"
+    wait_ready 900 && cmd_status
+}
+
+cmd_stop() {
+    take_lock wait || die "another serving operation is in progress"
+    # 'stop' must mean stopped: without this the cron would resurrect it within 5 minutes.
+    touch "$ROOT/logs/.paused"
+    local ids; ids=$(job_ids)
+    [ -z "$ids" ] && { info "not running (supervision paused; 'serving start' resumes it)"; return 0; }
+
+    # Cancel every matching job, not just one — duplicates can exist (a queued job behind a
+    # running one). PENDING jobs cannot drain, so they are cancelled outright rather than
+    # waiting out a 120s timeout for a signal nothing will handle.
+    local j st
+    for j in $ids; do
+        st=$(squeue -h -j "$j" -o '%T' 2>/dev/null)
+        if [ "$st" = "RUNNING" ]; then
+            info "draining job $j (in-flight requests get up to ${DRAIN_WAIT}s)..."
+            scancel --signal=TERM --batch "$j" 2>/dev/null
+        else
+            info "cancelling queued job $j"
+            scancel "$j" 2>/dev/null
+        fi
+    done
+
+    local i=0
+    while [ "$i" -lt "$DRAIN_WAIT" ]; do
+        [ -z "$(job_ids)" ] && { info "stopped; supervision paused."; return 0; }
+        sleep 5; i=$((i + 5))
+    done
+    warn "still up after ${DRAIN_WAIT}s; forcing"
+    for j in $(job_ids); do scancel "$j" 2>/dev/null; done
+    sleep 5
+    info "stopped; supervision paused."
+}
+
+cmd_restart() {
+    # cmd_stop/cmd_start each take the lock; flock on the same fd in the same shell is
+    # re-entrant, so this is safe and keeps the whole cycle exclusive.
+    take_lock wait || die "another serving operation is in progress"
+    cmd_stop
+    # vLLM releases ~88 GiB back to the unified pool asynchronously. Starting too soon
+    # trips vLLM's own free-memory gate, so wait for the machine to actually settle.
+    printf 'waiting for memory to be released '
+    local i=0
+    while [ "$i" -lt 90 ]; do
+        printf '.'; sleep 5; i=$((i + 5))
+        [ -z "$(job_state)" ] && [ "$i" -ge 20 ] && break
+    done
+    printf ' done\n'
+    cmd_start
+}
+
+cmd_status() {
+    if [ -f "$ROOT/logs/STATUS" ]; then
+        printf '\n%s*** %s ***%s\n' "$c_red" "SUPERVISION HAS GIVEN UP" "$c_off"
+        sed 's/^/  /' "$ROOT/logs/STATUS"
+    fi
+    local st node j code
+    st=$(job_state); j=$(job_id); node=$(job_node)
+    printf '\n%s=== job ===%s\n' "$c_dim" "$c_off"
+    if [ -z "$st" ]; then
+        printf '  %sNOT RUNNING%s   (serving start)\n' "$c_red" "$c_off"
+    else
+        printf '  %s%s%s  job %s on %s  (elapsed %s)\n' "$c_grn" "$st" "$c_off" "$j" "$node" \
+            "$(squeue -h -j "$j" -o '%M' 2>/dev/null)"
+    fi
+
+    printf '\n%s=== reachability (this host) ===%s\n' "$c_dim" "$c_off"
+    code=$(health)
+    if [ "$code" = "200" ]; then printf '  /health              %s200%s\n' "$c_grn" "$c_off"
+    else printf '  /health              %s%s%s  (endpoint not answering)\n' "$c_red" "${code:-000}" "$c_off"; fi
+    local nokey; nokey=$(curl -s -m 8 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/v1/models")
+    if [ "$nokey" = "200" ]; then
+        printf '  auth mode            %sSSH-only%s — any key in the trusted list can use it\n' "$c_grn" "$c_off"
+        printf '  /v1/models           200 (no API key needed once tunnelled)\n'
+    elif [ "$nokey" = "401" ]; then
+        printf '  auth mode            API key required\n'
+        printf '  /v1/models  +key     %s\n' "$(curl -s -m 8 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(first_key)" "http://127.0.0.1:$PORT/v1/models")"
+        printf '  /v1/models  no key   401  (enforced)\n'
+    else
+        printf '  /v1/models           %s%s%s (unexpected)\n' "$c_red" "$nokey" "$c_off"
+    fi
+    [ -n "$node" ] && printf '  %s:%s from network  %s  (000 = not publicly exposed)\n' "$node" "$PORT" \
+        "$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://$node:$PORT/health")"
+
+    [ "$code" = "200" ] || { printf '\nrun %sserving doctor%s for a diagnosis\n' "$c_yel" "$c_off"; return 1; }
+
+    printf '\n%s=== live load ===%s\n' "$c_dim" "$c_off"
+    curl -s -m 8 "http://127.0.0.1:$PORT/metrics" 2>/dev/null | awk '
+      /^vllm:num_requests_running\{/      {printf "  in flight            %d\n", $2}
+      /^vllm:num_requests_waiting\{/      {printf "  queued               %d\n", $2}
+      /^vllm:kv_cache_usage_perc\{/      {printf "  kv cache used        %.1f%%\n", $2*100}
+      /^vllm:prefix_cache_queries_total\{/{q=$2}
+      /^vllm:prefix_cache_hits_total\{/   {h=$2}
+      /^vllm:spec_decode_num_draft_tokens_total\{/   {d=$2}
+      /^vllm:spec_decode_num_accepted_tokens_total\{/{a=$2}
+      END {
+        if (q>0) printf "  prefix cache hits    %.1f%% of queried tokens\n", 100*h/q
+        if (d>0) printf "  MTP acceptance       %.1f%%  (%.2f tokens per forward pass)\n", 100*a/d, 1+a/(d/2)
+      }'
+    printf '\n%s=== companions (globus1) ===%s\n' "$c_dim" "$c_off"
+    "$ROOT/bin/webui" status 2>/dev/null | sed 's/^/  webui /'
+    if pgrep -f 'fair-proxy.py' >/dev/null 2>&1; then
+        printf '  fair-proxy on 127.0.0.1:8000 -> 8005 (per-user in-flight cap)\n'
+    else
+        printf '  fair-proxy NOT RUNNING — port 8000 is dead until supervise revives it\n'
+    fi
+    if pgrep -f 'repair-proxy.py' >/dev/null 2>&1; then
+        printf '  repair-proxy on 127.0.0.1:8001 (for Unsloth Studio; see CLIENTS.md)\n'
+    else
+        printf '  repair-proxy not running\n'
+    fi
+
+    printf '\n%s=== clients ===%s\n' "$c_dim" "$c_off"
+    printf '  tunnel   ssh -N -L %s:127.0.0.1:%s globus1\n' "$PORT" "$PORT"
+    printf '  base_url http://localhost:%s/v1     model  qwen3.8-27b\n' "$PORT"
+    printf '  browser  tunnel 8080 too, then http://localhost:8080\n\n'
+}
+
+cmd_logs() {
+    local log; log=$(cur_log)
+    [ -z "$log" ] && log=$(ls -1t "$ROOT"/logs/serve-*.out 2>/dev/null | head -1)
+    [ -z "$log" ] && die "no logs yet"
+    if [ "${1:-}" = "-f" ]; then tail -f "$log"; else tail -n "${1:-60}" "$log"; fi
+}
+
+cmd_test() {
+    [ "$(health)" = "200" ] || die "endpoint not answering; try 'serving doctor'"
+    "$ROOT/venv2/bin/python" "$ROOT/bin/smoke.py" "http://127.0.0.1:$PORT/v1" "$(first_key)"
+}
+
+cmd_keys() {
+    case "${1:-list}" in
+        list)
+            printf '%-14s %s\n' USER KEY
+            grep -E '^KEY_' "$KEYS" | while IFS='=' read -r k v; do printf '%-14s %s\n' "${k#KEY_}" "$v"; done ;;
+        add)
+            [ -n "${2:-}" ] || die "usage: serving keys add <name>"
+            grep -qE "^KEY_$2=" "$KEYS" && die "$2 already has a key"
+            printf 'KEY_%s=sk-globus-%s-%s\n' "$2" "$2" "$(openssl rand -hex 16)" >> "$KEYS"
+            chmod 600 "$KEYS"
+            info "added $2; run 'serving restart' for it to take effect"
+            grep -E "^KEY_$2=" "$KEYS" ;;
+        revoke)
+            [ -n "${2:-}" ] || die "usage: serving keys revoke <name>"
+            grep -qE "^KEY_$2=" "$KEYS" || die "no key for $2"
+            cp "$KEYS" "$KEYS.bak"; grep -vE "^KEY_$2=" "$KEYS.bak" > "$KEYS"; rm -f "$KEYS.bak"
+            chmod 600 "$KEYS"
+            info "revoked $2; run 'serving restart' to enforce it" ;;
+        *) die "usage: serving keys [list|add <name>|revoke <name>]" ;;
+    esac
+}
+
+cmd_doctor() {
+    if [ -f "$ROOT/logs/STATUS" ]; then
+        printf '\n%s*** SUPERVISION HAS GIVEN UP ***%s\n' "$c_red" "$c_off"
+        sed 's/^/  /' "$ROOT/logs/STATUS"
+    fi
+    printf '\n%s=== diagnosis ===%s\n' "$c_dim" "$c_off"
+    local st log node
+    st=$(job_state); log=$(cur_log); node=$(job_node)
+
+    if [ -z "$st" ]; then
+        printf '  %sno slurm job%s\n' "$c_red" "$c_off"
+        local last; last=$(ls -1t "$ROOT"/logs/serve-*.out 2>/dev/null | head -1)
+        if [ -n "$last" ]; then
+            printf '  last job log: %s\n' "$last"
+            printf '  exit line   : %s\n' "$(grep -E 'vllm exited with code' "$last" | tail -1)"
+            local why
+            why=$(grep -oE 'CUDA out of memory|Free memory on device[^.]*|FileNotFoundError[^ ]*|Ninja build failed|code=137|Engine core initialization failed' "$last" | tail -1)
+            [ -n "$why" ] && printf '  likely cause: %s%s%s\n' "$c_yel" "$why" "$c_off"
+        fi
+        printf '  fix: serving start\n\n'; return 1
+    fi
+
+    printf '  job %s is %s on %s\n' "$(job_id)" "$st" "$node"
+    if [ "$st" != "RUNNING" ]; then printf '  waiting for slurm to schedule it\n\n'; return 1; fi
+
+    if [ -n "$log" ] && ! grep -q 'Application startup complete' "$log" 2>/dev/null; then
+        printf '  %sstill starting%s — last milestone:\n' "$c_yel" "$c_off"
+        grep -E 'Model loading took|torch.compile took|GPU KV cache size|Capturing|profiling' "$log" 2>/dev/null | tail -1 | sed 's/^/    /'
+        printf '  cold start is ~5 min (weights 170s + compile + capture)\n\n'; return 1
+    fi
+
+    if [ "$(health)" != "200" ]; then
+        printf '  %sjob is up but the endpoint is not reachable here%s\n' "$c_red" "$c_off"
+        if grep -q 'WARNING: cannot publish' "$log" 2>/dev/null; then
+            printf '    the reverse tunnel to globus1 was never established\n'
+            printf '    fix: bash %s/bin/setup_reverse_tunnel.sh && serving restart\n' "$ROOT"
+        else
+            printf '    publisher line: %s\n' "$(grep -E 'publishing |publish preflight' "$log" 2>/dev/null | tail -1)"
+            printf '    the tunnel may have dropped; check: serving logs 40\n'
+        fi
+        printf '\n'; return 1
+    fi
+    printf '  %severything looks healthy%s\n\n' "$c_grn" "$c_off"
+}
+
+# Returns 0 if supervise should act now. Enforces backoff and a terminal give-up, so a
+# genuinely broken deployment cannot burn the node on a restart loop forever -- and, more
+# importantly, cannot look like "cron is handling it" while doing so.
+SUPER_STATE="$ROOT/logs/.supervise.state"
+SUPER_MAX=${SUPER_MAX:-5}
+supervise_attempt() {
+    local reason="$1" n=0 last=0 now wait_for
+    now=$(date +%s)
+    [ -f "$SUPER_STATE" ] && read -r n last < "$SUPER_STATE" 2>/dev/null
+    n=${n:-0}; last=${last:-0}
+    if [ "$n" -ge "$SUPER_MAX" ]; then
+        [ -f "$ROOT/logs/STATUS" ] || {
+            printf 'BROKEN since %s\nafter %d consecutive failed recoveries: %s\nsupervision has GIVEN UP; fix, then run: serving start\n' \
+                "$(date -Is)" "$n" "$reason" > "$ROOT/logs/STATUS"
+            logger -t qwen38-serve "GIVING UP after $n failed recoveries: $reason" 2>/dev/null
+            echo "[$(date -Is)] GIVING UP after $n failures ($reason)" >> "$ROOT/logs/supervise.log"
+        }
+        return 1
+    fi
+    wait_for=$(( 300 * (1 << n) )); [ "$wait_for" -gt 3600 ] && wait_for=3600
+    if [ "$last" -ne 0 ] && [ $((now - last)) -lt "$wait_for" ]; then return 1; fi
+    printf '%d %d\n' "$((n + 1))" "$now" > "$SUPER_STATE"
+    logger -t qwen38-serve "recovery attempt $((n+1))/$SUPER_MAX: $reason" 2>/dev/null
+    echo "[$(date -Is)] attempt $((n+1))/$SUPER_MAX ($reason)" >> "$ROOT/logs/supervise.log"
+    return 0
+}
+
+cmd_supervise() {
+    # Intended for cron. Quiet when healthy; restarts only when genuinely down.
+    #
+    # Companions first (before the lock/paused gates — pausing the MODEL should not
+    # take these down with it): revive repair-proxy if gone, and keep the read-only
+    # user-facing mirror in /shared/llm current (colleagues cannot read this home dir).
+    if ! pgrep -f 'fair-proxy.py' >/dev/null 2>&1; then
+        nohup python3 "$ROOT/bin/fair-proxy.py" >> "$ROOT/logs/fair-proxy.log" 2>&1 &
+        echo "[$(date -Is)] restarted fair-proxy" >> "$ROOT/logs/supervise.log"
+    fi
+    if ! pgrep -f 'repair-proxy.py' >/dev/null 2>&1; then
+        nohup python3 "$ROOT/bin/repair-proxy.py" >> "$ROOT/logs/repair-proxy.log" 2>&1 &
+        echo "[$(date -Is)] restarted repair-proxy" >> "$ROOT/logs/supervise.log"
+    fi
+    if [ -d /shared/llm ] && [ -n "$LOGIN_FQDN" ]; then
+        # The repo keeps <login-node> placeholders so it can be public; the mirror
+        # gets the real hostname substituted in, so colleagues can copy-paste.
+        local f
+        for f in QUICKSTART.md CLIENTS.md README.md bin/chat.py bin/llm-tunnel; do
+            sed "s|<login-node>|$LOGIN_FQDN|g" "$ROOT/$f" > "/shared/llm/$(basename "$f")" 2>/dev/null
+        done
+        for f in opencode.json globus_inference.py alcf_style.py openai_api.py; do
+            cp -u "$ROOT/examples/$f" /shared/llm/examples/ 2>/dev/null
+        done
+        chmod a+rx /shared/llm/chat.py /shared/llm/llm-tunnel 2>/dev/null
+        chmod -R a+rX,go-w /shared/llm 2>/dev/null
+    fi
+
+    # Lock first: the cron fires every 5 min but a restart (drain + memory settle + a ~5 min
+    # cold start) takes longer than that, so without this a slow restart would have a second
+    # supervise run tear it down half-way through and the endpoint would flap indefinitely.
+    [ -f "$ROOT/logs/.paused" ] && exit 0          # 'serving stop' means stopped
+    take_lock nowait || exit 0                      # a human operation is in progress
+
+    # Refuse to act on an unreadable cluster state, or we submit duplicates forever.
+    squeue -h -u "$ME" -o '%i' >/dev/null 2>&1 || exit 0
+
+    local st code
+    st=$(job_state); code=$(health)
+    if [ -n "$st" ] && [ "$code" = "200" ]; then rm -f "$SUPER_STATE" "$ROOT/logs/STATUS"; exit 0; fi
+    if [ -n "$st" ] && [ "$st" != "RUNNING" ]; then exit 0; fi          # pending: leave it alone
+    if [ -n "$st" ]; then
+        # Do NOT grep the log for 'Application startup complete': --open-mode=append plus a
+        # requeue reusing the same JobId means last run's marker is present immediately, so
+        # the guard would fire against a perfectly healthy reloading job. Elapsed time is
+        # reset by a requeue and is therefore the honest signal.
+        local mins; mins=$(squeue -h -j "$(job_id)" -o '%M' 2>/dev/null)
+        secs=$(awk -F: '{n=NF; s=$n; if(n>1) s+=60*$(n-1); if(n>2) s+=3600*$(n-2); print s}' <<<"${mins:-0:00}")
+        [ "${secs:-0}" -lt 720 ] && exit 0          # under 12 min: still cold-starting
+        supervise_attempt "unhealthy (http ${code:-000})" || exit 0
+        cmd_restart >> "$ROOT/logs/supervise.log" 2>&1
+        exit 0
+    fi
+    supervise_attempt "no job present" || exit 0
+    (cd "$ROOT" && sbatch "${SBATCH_ARGS[@]}" bin/serve.sh) >> "$ROOT/logs/supervise.log" 2>&1
+}
+
+case "${1:-status}" in
+    start)     shift; cmd_start "$@" ;;
+    stop)      shift; cmd_stop "$@" ;;
+    restart)   shift; cmd_restart "$@" ;;
+    status|"") shift 2>/dev/null; cmd_status ;;
+    logs)      shift; cmd_logs "$@" ;;
+    test)      shift; cmd_test "$@" ;;
+    keys)      shift; cmd_keys "$@" ;;
+    doctor)    shift; cmd_doctor "$@" ;;
+    supervise) shift; cmd_supervise "$@" ;;
+    -h|--help|help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown command '$1' (try: serving help)" ;;
+esac

@@ -1,0 +1,105 @@
+---
+# Serving stack for the Qwen3.8-27B endpoint. Run as the operator user, locally:
+#   ansible-playbook -i localhost, -c local site.yml
+# No root. See ansible/README.md for scope and deliberate omissions.
+
+- name: LLM serving stack (operator-level, no root)
+  hosts: all
+  gather_facts: false
+  vars:
+    serving_root: "{{ lookup('env', 'HOME') }}/serving"
+    python_version: "3.12"
+    model_dir: /scratch/models/Qwen3.8-27B-NVFP4
+    shared_mirror: /shared/llm
+
+  tasks:
+    - name: Private state directories exist and stay private
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0700"
+      loop:
+        - "{{ serving_root }}/logs"
+        - "{{ serving_root }}/webui-data"
+
+    - name: etc directory for generated config (keys land here as 0600)
+      ansible.builtin.file:
+        path: "{{ serving_root }}/etc"
+        state: directory
+        mode: "0755"
+
+    - name: vLLM virtualenv (long first build; no-op afterwards)
+      ansible.builtin.command:
+        cmd: uv venv venv2 -p {{ python_version }}
+        chdir: "{{ serving_root }}"
+        creates: "{{ serving_root }}/venv2/bin/python"
+
+    - name: vLLM + deps into venv2
+      ansible.builtin.command:
+        cmd: uv pip install -p venv2/bin/python vllm==0.27.1
+        chdir: "{{ serving_root }}"
+        creates: "{{ serving_root }}/venv2/bin/vllm"
+
+    - name: sm120 GDN prefill kernel patch (re-run after vLLM upgrades)
+      ansible.builtin.command:
+        cmd: bash bin/patch_vllm_gdn_sm120.sh
+        chdir: "{{ serving_root }}"
+      register: gdn_patch
+      changed_when: "'already' not in gdn_patch.stdout"
+
+    - name: Open WebUI virtualenv
+      ansible.builtin.command:
+        cmd: uv venv venv-webui -p {{ python_version }}
+        chdir: "{{ serving_root }}"
+        creates: "{{ serving_root }}/venv-webui/bin/python"
+
+    - name: Open WebUI into venv-webui
+      ansible.builtin.command:
+        cmd: uv pip install -p venv-webui/bin/python open-webui
+        chdir: "{{ serving_root }}"
+        creates: "{{ serving_root }}/venv-webui/bin/open-webui"
+
+    - name: Reverse-tunnel key and authorized_keys entry (script is idempotent)
+      ansible.builtin.command:
+        cmd: bash bin/setup_reverse_tunnel.sh
+        chdir: "{{ serving_root }}"
+      register: tunnel
+      changed_when: "'added' in tunnel.stdout"
+
+    - name: serving CLI on PATH
+      ansible.builtin.file:
+        src: "{{ serving_root }}/bin/serving"
+        dest: "{{ lookup('env', 'HOME') }}/.local/bin/serving"
+        state: link
+
+    - name: Supervise cron — model endpoint + companion proxies
+      ansible.builtin.cron:
+        name: qwen38-serve supervise
+        minute: "*/5"
+        job: "{{ serving_root }}/bin/serving supervise >/dev/null 2>&1"
+
+    - name: Ensure cron — web UI stack
+      ansible.builtin.cron:
+        name: webui ensure
+        minute: "*/5"
+        job: "{{ serving_root }}/bin/webui ensure >/dev/null 2>&1"
+
+    - name: Read-only user-facing mirror (kept fresh by supervise thereafter)
+      ansible.builtin.file:
+        path: "{{ shared_mirror }}/examples"
+        state: directory
+        mode: "0755"
+
+    # The weights live on the COMPUTE node's local disk, so test over ssh — an
+    # `is exists` filter would check the login node and always resubmit.
+    - name: Check model weights on the compute node
+      ansible.builtin.command: ssh -o BatchMode=yes globus3 test -d {{ model_dir }}
+      register: model_present
+      changed_when: false
+      failed_when: false
+
+    - name: Fetch model weights (slurm job on the compute node)
+      ansible.builtin.command:
+        cmd: sbatch bin/fetch_model.sh
+        chdir: "{{ serving_root }}"
+      when: model_present.rc != 0
