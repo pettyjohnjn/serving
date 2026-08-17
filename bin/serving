@@ -364,7 +364,7 @@ cmd_supervise() {
         # The repo keeps <login-node> placeholders so it can be public; the mirror
         # gets the real hostname substituted in, so colleagues can copy-paste.
         local f
-        for f in QUICKSTART.md CLIENTS.md README.md bin/chat.py bin/llm-tunnel; do
+        for f in QUICKSTART.md CLIENTS.md README.md DESIGN.md bin/chat.py bin/llm-tunnel; do
             sed "s|<login-node>|$LOGIN_FQDN|g" "$ROOT/$f" > "/shared/llm/$(basename "$f")" 2>/dev/null
         done
         for f in opencode.json globus_inference.py alcf_style.py openai_api.py; do
