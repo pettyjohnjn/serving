@@ -218,17 +218,19 @@
   function hideMenu() { effMenu.style.display = 'none'; }
 
   // ---- docking --------------------------------------------------------------
+  let lastRow = null;
+
   function bestAnchor() {
-    // Anchor priority: the model selector dropdown in the prompt bar (its id
-    // index varies — "model-selector-<n>-button" — so match by prefix+suffix,
-    // scoped to the send button's form so a selector elsewhere in the page can't
-    // steal the widgets), then the Dictate (voice) button, then the send button.
-    const send = document.getElementById('send-message-button');
-    const bar = send && (send.closest('form') || send.parentElement);
+    // Anchor priority: the model selector dropdown (its id index varies —
+    // "model-selector-<n>-button" — so match by prefix+suffix), then the Dictate
+    // (voice) button, then the send button. The selector leads because it is the
+    // only control that stays put while a response is generating: the send
+    // button is swapped for an id-less stop button, so anchoring on it made the
+    // widgets jump to the floating corner during every generation.
     const anchor =
-         (bar && bar.querySelector('[id^="model-selector-"][id$="-button"]'))
+         document.querySelector('[id^="model-selector-"][id$="-button"]')
       || document.getElementById('voice-input-button')
-      || send;
+      || document.getElementById('send-message-button');
     if (!anchor) return null;
     // Each prompt-bar control sits inside tooltip-wrapper divs whose hover
     // listener covers everything inside them — docking inside one made hovering
@@ -247,9 +249,16 @@
     // when the widgets aren't already sitting before the best available anchor.
     const target = bestAnchor();
     if (target && target.parentElement) {
-      if (target.previousElementSibling === box) return;
+      if (target.previousElementSibling !== box) {
+        box.classList.remove('floating');
+        target.parentElement.insertBefore(box, target);
+      }
+      lastRow = target.parentElement;
+    } else if (!box.isConnected && lastRow && lastRow.isConnected) {
+      // Every anchor id is momentarily gone (mid-render): keep the widgets in
+      // the row they last docked in instead of jumping to the corner.
       box.classList.remove('floating');
-      target.parentElement.insertBefore(box, target);
+      lastRow.appendChild(box);
     } else if (!box.isConnected) {
       box.classList.add('floating');
       document.body.appendChild(box);
