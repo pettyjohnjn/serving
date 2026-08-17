@@ -10,7 +10,7 @@ no accounts, no passwords anywhere in the stack.
 Open a tunnel to the login node and leave it running:
 
 ```bash
-ssh -N -L 8000:127.0.0.1:8000 -L 8080:127.0.0.1:8080 <login-node>
+ssh -N -L 8000:127.0.0.1:8000 -L 8080:127.0.0.1:8080 globus1
 ```
 
 Then either open **http://localhost:8080** and chat in the browser (you are
