@@ -218,18 +218,38 @@
   function hideMenu() { effMenu.style.display = 'none'; }
 
   // ---- docking --------------------------------------------------------------
+  function bestAnchor() {
+    // Anchor priority: the model selector dropdown in the prompt bar (its id
+    // index varies — "model-selector-<n>-button" — so match by prefix+suffix,
+    // scoped to the send button's form so a selector elsewhere in the page can't
+    // steal the widgets), then the Dictate (voice) button, then the send button.
+    const send = document.getElementById('send-message-button');
+    const bar = send && (send.closest('form') || send.parentElement);
+    const anchor =
+         (bar && bar.querySelector('[id^="model-selector-"][id$="-button"]'))
+      || document.getElementById('voice-input-button')
+      || send;
+    if (!anchor) return null;
+    // Each prompt-bar control sits inside tooltip-wrapper divs whose hover
+    // listener covers everything inside them — docking inside one made hovering
+    // our widgets pop that control's tooltip ("Dictate"). Climb out of the
+    // single-child wrappers and dock as a sibling of the whole control instead.
+    let a = anchor;
+    while (a.parentElement && a.parentElement !== document.body
+           && a.parentElement.children.length === 1) {
+      a = a.parentElement;
+    }
+    return a;
+  }
+
   function dock() {
-    // Best anchor first: just left of the model selector dropdown in the prompt
-    // bar, then the Dictate (voice) button, then the send button. Idempotent —
-    // safe to call on every mutation tick; it only touches the DOM when the
-    // widgets aren't already sitting before the best available anchor.
-    const anchor = document.getElementById('model-selector-0-button')
-                || document.getElementById('voice-input-button')
-                || document.getElementById('send-message-button');
-    if (anchor && anchor.parentElement) {
-      if (anchor.previousElementSibling === box) return;
+    // Idempotent — safe to call on every mutation tick; it only touches the DOM
+    // when the widgets aren't already sitting before the best available anchor.
+    const target = bestAnchor();
+    if (target && target.parentElement) {
+      if (target.previousElementSibling === box) return;
       box.classList.remove('floating');
-      anchor.parentElement.insertBefore(box, anchor);
+      target.parentElement.insertBefore(box, target);
     } else if (!box.isConnected) {
       box.classList.add('floating');
       document.body.appendChild(box);
