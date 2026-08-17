@@ -15,17 +15,22 @@ It is an OpenAI-compatible API, so anything that speaks "OpenAI base URL + key" 
 Qwen3.8 is a thinking model and its own chat template defaults to `reasoning_effort: "xhigh"`.
 On this box that means a minute or more of thinking tokens before you see any answer.
 
-The server default is `medium`. Override per request:
+The server default is `medium`. Override per request — `reasoning_effort` is a first-class
+field on chat completions and the OpenAI SDK passes it through as a named argument:
 
 ```python
-extra_body={"chat_template_kwargs": {"reasoning_effort": "xhigh"}}   # hard problems
-extra_body={"chat_template_kwargs": {"enable_thinking": False}}      # fastest, no thinking
+reasoning_effort="xhigh"    # hard problems
+reasoning_effort="none"     # thinking off entirely — fastest
 ```
 
-Levels: `low`, `medium`, `high`, `xhigh` — but `high` and `xhigh` render identical prompts
-(the template aliases them), and `medium` injects no directive at all. Thinking spends from
-`max_tokens`, so give hard problems a real budget (16384+) or the model can exhaust it
-before answering.
+(`extra_body={"chat_template_kwargs": {"reasoning_effort": ...}}` is the same knob by
+another route, and `{"enable_thinking": False}` ≡ `"none"`.) The template accepts exactly
+`low`, `medium`, `xhigh`: `high` is an alias for `xhigh` (identical rendered prompt),
+`medium` injects no directive at all, and anything else (`minimal`, `max`, …) is a 400
+straight from the template. `none` never reaches the template — vLLM turns it into
+thinking-disabled first. Thinking spends from `max_tokens`, so give hard problems a real
+budget (16384+) or the model can exhaust it before answering. In the browser UI the same
+choice is the effort pill in the prompt bar.
 
 ---
 
@@ -255,13 +260,19 @@ What's turned on:
   pages go straight into the model's context (`BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL`)
   rather than through an embedding pipeline — the 262K window makes that the simpler and
   better path. Searches leave the cluster, so don't paste secrets into searched chats.
-- **Context ring** (in the input toolbar, beside Dictate; injected by
-  `bin/webui-ring.js`): fills as the chat's context grows against the 262,144-token
-  window, amber past 60%, red past 85%. Hover for the numbers; **click to compact**
-  the conversation via Open WebUI's native endpoint (older turns become a summary, the
-  recent 40% stays verbatim). A MutationObserver re-docks it when the SPA rebuilds the
-  input bar; if an upgrade renames `#voice-input-button`/`#send-message-button` it
-  falls back to floating above the bar. Ignore the message-info popup's token counts: they **sum every
+- **Effort pill** (prompt bar, just left of the model selector; injected by
+  `bin/webui-ring.js`): pick `off` / `low` / `med` / `xhigh` for the messages you
+  send — `off` answers immediately with no thinking, `med` is the server default.
+  The choice sticks per browser, across chats, and is applied by tagging outgoing
+  chat requests with `reasoning_effort`; a value set in Chat Controls → Advanced
+  Params still wins if you use both.
+- **Context ring** (next to the effort pill): fills as the chat's context grows
+  against the 262,144-token window, amber past 60%, red past 85%. Hover for the
+  numbers; **click to compact** the conversation via Open WebUI's native endpoint
+  (older turns become a summary, the recent 40% stays verbatim). A MutationObserver
+  re-docks both widgets when the SPA rebuilds the input bar; if an upgrade renames
+  the model-selector/Dictate/send anchors they fall back to floating above the bar.
+  Ignore the message-info popup's token counts: they **sum every
   internal model call** behind a message (search-query generation, the response,
   titles/tags), so they read several times higher than real context usage.
 - **Code execution runs in the user's browser**, not on the cluster. Both the code

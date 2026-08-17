@@ -39,8 +39,9 @@ alive()  { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
 #   1. drop the " (Open WebUI)" suffix env.py forces onto a custom WEBUI_NAME;
 #   2. bump the frontend root font size — the UI is rem-based, so this scales
 #      everything (users can still fine-tune with browser zoom);
-#   3. inject the context ring (bin/webui-ring.js): window usage in the prompt
-#      bar, hover for numbers, click to compact via the native /compact endpoint.
+#   3. inject the prompt-bar widgets (bin/webui-ring.js): the context ring
+#      (hover for usage, click to compact) and the reasoning-effort pill
+#      (off / low / med / xhigh), docked left of the model selector.
 patch_branding() {
     local sp="$VENV/lib/python3.12/site-packages/open_webui"
     python3 - "$sp" "$ROOT/bin/webui-ring.js" <<'EOF'
