@@ -1,13 +1,17 @@
 // Context ring for Open WebUI — injected into frontend/index.html by bin/webui.
 //
-// Docks inside the prompt bar next to the send button: a small ring that fills as
-// the chat's context grows against the model's 262,144-token window. Hover for numbers; click to compact the conversation now via Open WebUI's
-// native endpoint. Auto-compaction is also enabled server-side, so the ring is
-// awareness + a manual trigger, not the only safety net.
+// Docks in the prompt-bar toolbar, just left of the model selector dropdown: a
+// small ring that fills as the chat's context grows against the model's
+// 262,144-token window. Hover for numbers; click to compact the conversation now
+// via Open WebUI's native endpoint. Auto-compaction is also enabled server-side,
+// so the ring is awareness + a manual trigger, not the only safety net.
 //
-// The prompt bar is rebuilt on every SPA navigation, so a MutationObserver
-// re-docks the ring whenever it falls out of the DOM. If the send button ever
-// changes id in an upgrade, the ring falls back to a fixed corner position.
+// The prompt bar is rebuilt on every SPA navigation — and doesn't exist yet when
+// this script first runs — so a MutationObserver keeps re-running dock(): it
+// re-attaches the ring when it falls out of the DOM, upgrades it out of the
+// floating fallback once the toolbar renders, and moves it up the anchor list if
+// a better anchor appears. If every known anchor id vanishes in an upgrade, the
+// ring falls back to a fixed corner position.
 //
 // Data: GET /api/v1/chats/{id} -> context_usage {tokens, threshold}, using the
 // user's own session token from localStorage.
@@ -116,13 +120,15 @@
   }
 
   function dock() {
-    if (ring.isConnected && !ring.classList.contains('floating')) return;
-    // Prefer the input toolbar row (More / Integrations / Dictate …): sit just left
-    // of the Dictate (voice) button. Fall back to the send button's row, then to
-    // floating above the bar if an upgrade renames both ids.
-    const anchor = document.getElementById('voice-input-button')
+    // Best anchor first: just left of the model selector dropdown in the prompt
+    // bar, then the Dictate (voice) button, then the send button. Idempotent —
+    // safe to call on every mutation tick; it only touches the DOM when the ring
+    // isn't already sitting before the best available anchor.
+    const anchor = document.getElementById('model-selector-0-button')
+                || document.getElementById('voice-input-button')
                 || document.getElementById('send-message-button');
     if (anchor && anchor.parentElement) {
+      if (anchor.previousElementSibling === ring) return;
       ring.classList.remove('floating');
       anchor.parentElement.insertBefore(ring, anchor);
     } else if (!ring.isConnected) {
@@ -154,10 +160,12 @@
     ring.addEventListener('click', compact);
     dock();
 
-    // The SPA rebuilds the input bar constantly; cheap re-dock when we fall out.
+    // The SPA rebuilds the input bar constantly, and at first mount it hasn't
+    // rendered at all (which used to strand the ring in the floating corner).
+    // Re-run dock() on mutations, throttled; dock() itself no-ops when placed.
     let pending = false;
     new MutationObserver(() => {
-      if (pending || ring.isConnected) return;
+      if (pending) return;
       pending = true;
       setTimeout(() => { pending = false; dock(); }, 250);
     }).observe(document.body, { childList: true, subtree: true });
