@@ -384,6 +384,14 @@ drain, then vLLM exits (~30 s), slurm holds the requeued job ~2 min (`Reason=Beg
 and the model reloads — **healthy again ~7 min after the signal**. Clients need no action;
 their tunnels target globus1, which stays up throughout.
 
+**Usage history.** The identity proxy samples vLLM's token counters every 30 s and folds
+the deltas into hourly buckets in `logs/token-usage.json` — the counters themselves reset
+on every engine restart, so they cannot be read as lifetime figures. Each probe also
+records whether the endpoint answered. The stats page turns the buckets into 24 h / 7 d /
+30 d / all-time token totals (decode vs prefill), a usage graph, and uptime percentages.
+The buckets are whole-box aggregates: token counts and probe results only, no content and
+no per-user attribution.
+
 ## Privacy
 
 What the endpoint does and does not retain, verified against the running system rather than
@@ -396,7 +404,8 @@ code`, `thread-safe LRU`) returns **zero matches**. The logs hold engine lifecyc
 metrics only. `logs/` is mode 0700.
 
 **Nothing with request content is written to disk.** The only persisted state is compile and
-JIT caches (`~/.cache/vllm/torch_compile_cache`, `/scratch/jit-cache`) and model weights.
+JIT caches (`~/.cache/vllm/torch_compile_cache`, `/scratch/jit-cache`), model weights, and
+aggregate token/uptime counters (`logs/token-usage.json` — numbers only, no content).
 Conversations exist only in GPU memory for the life of the request.
 
 **Outbound telemetry is disabled.** vLLM posts anonymous usage stats to `https://stats.vllm.ai`

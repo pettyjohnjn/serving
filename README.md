@@ -44,7 +44,7 @@ browser UI's features.
 | speed, busy | ~11 tok/s each at the 32-request cap; overflow queues, nothing is dropped |
 | long prompts | cold prefill ~1,000 tok/s; prefix caching makes repeat context ~14× faster |
 | fairness | work-conserving: one user may fill all 32 slots, but under contention freed slots go to whoever holds least |
-| live stats | http://localhost:8080/globus-stats — tok/s, load, GPU, queue |
+| live stats | http://localhost:8080/globus-stats — tok/s, load, GPU, queue, token history, uptime |
 | availability | supervised via cron; survives node reboots and the 2-day slurm limit with a ~7 min blip |
 
 ## Operating it

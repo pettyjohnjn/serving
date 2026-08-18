@@ -293,7 +293,10 @@ What's turned on:
   response for any client that wants it.
 - **Live stats page** at `/globus-stats` (served by the identity proxy, not Open WebUI):
   whole-box generation and prefill tok/s, requests in flight, queue depth, KV-cache use,
-  prefix-hit rate. Refreshes every 2 s.
+  prefix-hit rate. Refreshes every 2 s. Below the live cards: **token history** (24 h /
+  7 d / 30 d / all-time totals split decode vs prefill, with a usage graph) and
+  **uptime** over the same windows, measured by a 30 s probe from the login node. The
+  history is aggregate whole-box counts — nothing is tracked per user or per request.
 - **Branding/scale**: `WEBUI_NAME` is "Globus Cluster Inference"; `bin/webui` re-applies
   two small package patches on every start (drop the forced "(Open WebUI)" name suffix,
   18px root font) so pip upgrades cannot revert them.
