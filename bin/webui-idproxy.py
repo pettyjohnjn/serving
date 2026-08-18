@@ -53,6 +53,7 @@ STATS_KEYS = {
     "vllm:prefix_cache_queries_total": "prefix_queries",
     "vllm:prefix_cache_hits_total": "prefix_hits",
     "vllm:request_success_total": "requests",
+    "vllm:num_preemptions_total": "preemptions",
     "vllm:time_to_first_token_seconds_sum": "ttft_sum",
     "vllm:time_to_first_token_seconds_count": "ttft_count",
     "vllm:inter_token_latency_seconds_sum": "itl_sum",
@@ -86,32 +87,35 @@ def usage_load():
             s = json.load(f)
         if isinstance(s.get("hours"), dict) and "lifetime" in s:
             for v in s["hours"].values():           # older, shorter layouts
-                while len(v) < 5:
+                while len(v) < 6:
                     v.append(0)
             s["lifetime"].setdefault("up", 0)
             s["lifetime"].setdefault("total", 0)
             s["lifetime"].setdefault("reqs", 0)
+            s["lifetime"].setdefault("preempt", 0)
             return s
     except (OSError, ValueError):
         pass
     return {"since": time.time(),
-            "lifetime": {"prompt": 0.0, "gen": 0.0, "up": 0, "total": 0, "reqs": 0},
+            "lifetime": {"prompt": 0.0, "gen": 0.0, "up": 0, "total": 0, "reqs": 0,
+                         "preempt": 0},
             "last": None, "hours": {}}
 
 
 def usage_update(state, snap, now):
-    """Fold one stats_snapshot into the hourly buckets: [prompt, gen, up, probes, reqs]."""
-    hour = state["hours"].setdefault(str(int(now // 3600)), [0.0, 0.0, 0, 0, 0])
+    """Fold a stats_snapshot into the buckets: [prompt, gen, up, probes, reqs, preempt]."""
+    hour = state["hours"].setdefault(str(int(now // 3600)), [0.0, 0.0, 0, 0, 0, 0])
     hour[3] += 1
     state["lifetime"]["total"] += 1
     if snap.get("up"):
         hour[2] += 1
         state["lifetime"]["up"] += 1
     if snap.get("up") and "prompt_tokens" in snap and "generation_tokens" in snap:
-        cur = [snap["prompt_tokens"], snap["generation_tokens"], snap.get("requests", 0.0)]
+        cur = [snap["prompt_tokens"], snap["generation_tokens"],
+               snap.get("requests", 0.0), snap.get("preemptions", 0.0)]
         last = state.get("last")
         if last is not None:
-            while len(last) < 3:
+            while len(last) < 4:
                 last.append(0.0)
             d = [c - l for c, l in zip(cur, last)]
             if min(d) < 0:                     # engine restarted, counters reset
@@ -119,9 +123,11 @@ def usage_update(state, snap, now):
             hour[0] += d[0]
             hour[1] += d[1]
             hour[4] += d[2]
+            hour[5] += d[3]
             state["lifetime"]["prompt"] += d[0]
             state["lifetime"]["gen"] += d[1]
             state["lifetime"]["reqs"] += d[2]
+            state["lifetime"]["preempt"] += d[3]
         state["last"] = cur
     cutoff = int(now // 3600) - USAGE_KEEP_H
     for k in [k for k in state["hours"] if int(k) < cutoff]:
@@ -132,7 +138,7 @@ def usage_derive(state, now):
     cur = int(now // 3600)
 
     def window(nh):
-        p = g = up = total = r = 0
+        p = g = up = total = r = pre = 0
         for k, v in state["hours"].items():
             if int(k) > cur - nh:
                 p += v[0]
@@ -140,11 +146,13 @@ def usage_derive(state, now):
                 up += v[2]
                 total += v[3]
                 r += v[4]
-        return {"prompt": p, "gen": g, "up": up, "total": total, "reqs": r}
+                pre += v[5]
+        return {"prompt": p, "gen": g, "up": up, "total": total, "reqs": r,
+                "preempt": pre}
 
     # hourly rows feed both the usage chart (prompt, gen) and the 90-day
     # availability strip (up, probes)
-    hourly = sorted((int(k), round(v[0]), round(v[1]), v[2], v[3])
+    hourly = sorted((int(k), round(v[0]), round(v[1]), v[2], v[3], v[5])
                     for k, v in state["hours"].items())
     return {"since": state["since"], "lifetime": dict(state["lifetime"]),
             "day": window(24), "week": window(24 * 7), "month": window(24 * 30),
@@ -316,7 +324,7 @@ footer{color:var(--muted);font-size:.78rem;margin-top:2rem;line-height:1.7}
 
 <div class="eyebrow">Usage</div>
 <div class="card">
-<table class="utab"><thead><tr><th></th><th>tokens</th><th>decode</th><th>prefill</th><th>requests</th></tr></thead>
+<table class="utab"><thead><tr><th></th><th>tokens</th><th>decode</th><th>prefill</th><th>requests</th><th>preempted</th></tr></thead>
 <tbody id="utab"></tbody></table>
 <div class="chead"><span class="legend"><b>history</b><i></i>decode<i class="pf"></i>prefill</span>
 <span class="rng"><button data-r="24h" class="on">24 h</button><button data-r="7d">7 d</button><button data-r="30d">30 d</button></span></div>
@@ -347,10 +355,18 @@ async function tick(){
    prev=null;return;
   }
   const waiting=Math.round(s.waiting??0);
-  if(waiting>0||!web){
+  if(waiting>0||!web||recentPreempt>0){
    banner.className='banner warn';setDot(g('pdot'),'warn');g('ptxt').textContent='degraded';
-   g('bstate').textContent=waiting>0?'Operational — under load':'API operational — web UI down';
-   g('bsub').textContent=waiting>0?waiting+' request(s) queued — new requests will wait briefly':'the OpenAI API works; the browser chat backend is not answering';
+   if(!web){
+    g('bstate').textContent='API operational — web UI down';
+    g('bsub').textContent='the OpenAI API works; the browser chat backend is not answering';
+   }else if(recentPreempt>0){
+    g('bstate').textContent='Operational — KV cache under pressure';
+    g('bsub').textContent=recentPreempt+' request(s) preempted in the last hour — long contexts are competing for cache, so some requests pause and resume';
+   }else{
+    g('bstate').textContent='Operational — under load';
+    g('bsub').textContent=waiting+' request(s) queued — new requests will wait briefly';
+   }
   }else{
    banner.className='banner ok';setDot(g('pdot'),'ok');g('ptxt').textContent='operational';
    g('bstate').textContent='All systems operational';
@@ -381,7 +397,7 @@ async function tick(){
  }catch(e){g('age').textContent='stats fetch failed: '+e;setDot(g('pdot'),'warn');g('ptxt').textContent='unreachable'}
 }
 // ---- usage history + availability strip (fetched every minute) ----
-let usage=null,range='24h';
+let usage=null,range='24h',recentPreempt=0;
 function showTip(e,html){tip.innerHTML=html;tip.style.display='block';
  tip.style.left=Math.min(window.innerWidth-tip.offsetWidth-8,Math.max(8,e.clientX-tip.offsetWidth/2))+'px';
  tip.style.top=(e.clientY-tip.offsetHeight-12)+'px'}
@@ -419,10 +435,12 @@ function cards(){
  const rows=[['24 h',usage.day],['7 d',usage.week],['30 d',usage.month],['all time',usage.lifetime]];
  for(const [name,w] of rows){
   const tr=document.createElement('tr');
-  const cells=[name,fmt(w.prompt+w.gen),fmt(w.gen),fmt(w.prompt),fmt(w.reqs??0)];
+  const cells=[name,fmt(w.prompt+w.gen),fmt(w.gen),fmt(w.prompt),fmt(w.reqs??0),fmt(w.preempt??0)];
   tr.innerHTML=cells.map(c=>'<td>'+c+'</td>').join('');
   tb.appendChild(tr);
  }
+ const curH=Math.floor(Date.now()/36e5);
+ recentPreempt=usage.hourly.filter(r=>r[0]>=curH-1).reduce((a,r)=>a+(r[5]||0),0);
  g('since').textContent=new Date(usage.since*1000).toLocaleDateString();
 }
 function draw(){

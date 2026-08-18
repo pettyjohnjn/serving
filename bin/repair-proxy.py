@@ -12,7 +12,10 @@ This proxy truncates each arguments string to its first complete JSON value
 included. It logs only repair events -- lengths and a short excerpt of the discarded
 tail, never whole prompts. Counters at /proxy-stats.
 
-Run on globus1:    ./repair-proxy.py --listen 8001 --upstream 8000
+Runs on globus1:8001 (started by `serving supervise`, no arguments). Upstream is the
+published endpoint on 8005 -- the same short-circuit the web UI takes: this proxy has
+no way to attribute a request to the user behind it, so routing it through the
+fairness gateway on 8000 would bill every client's traffic to the operator account.
 Laptop tunnel:     ssh -N -L 8000:127.0.0.1:8001 globus1
 """
 import argparse
