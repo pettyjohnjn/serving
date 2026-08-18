@@ -387,8 +387,11 @@ their tunnels target globus1, which stays up throughout.
 **Usage history.** The identity proxy samples vLLM's token counters every 30 s and folds
 the deltas into hourly buckets in `logs/token-usage.json` — the counters themselves reset
 on every engine restart, so they cannot be read as lifetime figures. Each probe also
-records whether the endpoint answered. The stats page turns the buckets into 24 h / 7 d /
-30 d / all-time token totals (decode vs prefill), a usage graph, and uptime percentages.
+records whether the endpoint answered (engine and fairness gateway both reachable — the
+sampler reads the engine's port directly so its own probes never bill the fairness
+ledger). The stats page turns the buckets — retained 92 days — into 24 h / 7 d / 30 d /
+all-time token and request totals (decode vs prefill), a usage graph, a 90-day
+per-day availability strip, and uptime percentages.
 The buckets are whole-box aggregates: token counts and probe results only, no content and
 no per-user attribution.
 

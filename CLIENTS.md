@@ -291,12 +291,15 @@ What's turned on:
   that is what an early "120K tokens on hello world" reading was.)
 - vLLM runs `--enable-force-include-usage`, so token usage is present on every API
   response for any client that wants it.
-- **Live stats page** at `/globus-stats` (served by the identity proxy, not Open WebUI):
-  whole-box generation and prefill tok/s, requests in flight, queue depth, KV-cache use,
-  prefix-hit rate. Refreshes every 2 s. Below the live cards: **token history** (24 h /
-  7 d / 30 d / all-time totals split decode vs prefill, with a usage graph) and
-  **uptime** over the same windows, measured by a 30 s probe from the login node. The
-  history is aggregate whole-box counts — nothing is tracked per user or per request.
+- **Status page** at `/globus-stats` (served by the identity proxy, not Open WebUI),
+  status-page style: an overall banner (operational / under load / offline), per-component
+  health (engine, fairness gateway, web UI), and a 90-day availability strip fed by a
+  30 s probe from the login node — hover a day for its uptime. Live cards refresh every
+  2 s: whole-box generation and prefill tok/s, time to first token, per-stream decode
+  speed, requests in flight, queue depth, active users, KV-cache use, and node GPU/
+  memory/CPU. Below that, **usage history**: token totals for 24 h / 7 d / 30 d /
+  all-time split decode vs prefill, request counts, and a usage graph. The history is
+  aggregate whole-box counts — nothing is tracked per user or per request.
 - **Branding/scale**: `WEBUI_NAME` is "Globus Cluster Inference"; `bin/webui` re-applies
   two small package patches on every start (drop the forced "(Open WebUI)" name suffix,
   18px root font) so pip upgrades cannot revert them.
