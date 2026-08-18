@@ -270,7 +270,7 @@ Two results, one of which refuted the hypothesis that motivated the sweep:
 
 1. **The concurrency cap was the real limit.** `MAX_SEQS=16` capped aggregate at 203 tok/s;
    at 32 it reaches **323 tok/s (+59%)**. Memory was never close to binding — 32 sequences
-   at 32K context sits well inside the 1.7M-token KV pool. Per-request speed falls from
+   at 32K context sits well inside the 2M-token KV pool. Per-request speed falls from
    16.4 to 11.2 tok/s, which is the correct trade for batch work.
 2. **Speculation does *not* invert under load.** The prediction was that drafting would stop
    paying once the batch filled the machine, so `SPEC=1` or `0` would win at high
@@ -329,7 +329,7 @@ combined with `--mamba-ssm-cache-dtype bfloat16`.
 | `--kv-cache-dtype fp8` | | halves both KV footprint *and* the per-step KV read, which directly speeds long-context decode |
 | `--max-model-len 262144` | full native | affordable thanks to hybrid attention |
 | `--max-num-seqs 32` | | aggregate throughput kept climbing past 16 (203 → 323 tok/s); memory never binds |
-| `--kv-cache-memory` | 60 GiB pinned | on unified memory vLLM's utilization heuristic can't see the slurm cgroup; a fixed pool is identical across requeues |
+| `--kv-cache-memory` | 71 GiB pinned (~2M tokens) | on unified memory vLLM's utilization heuristic can't see the slurm cgroup; a fixed pool is identical across requeues |
 | `--gpu-memory-utilization 0.80` | | still required — vLLM gates startup on free memory even with a pinned pool, and its 0.92 default fails during restarts |
 | `--max-num-batched-tokens 2048` | | prefill chunk = the unit of head-of-line blocking; at 8192 a 130K cold prefill stalled others' TTFT to ~23 s, at 2048 it is ~5 s with no measured prefill cost |
 | `--enable-prefix-caching` | | agentic loops resend near-identical prompts; this is a large practical win |

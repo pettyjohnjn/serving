@@ -47,7 +47,7 @@ TUNNEL_KEY=${TUNNEL_KEY:-$HOME/.ssh/id_llm_tunnel}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-262144}
 # 32, not 16. Aggregate throughput keeps climbing past the old cap (203 -> 323 tok/s,
 # +59%) and memory is nowhere near binding: 32 sequences at 32K context is well inside the
-# 1.7M-token KV pool. The cost is per-request latency (16.4 -> 11.2 tok/s at full load),
+# 2M-token KV pool. The cost is per-request latency (16.4 -> 11.2 tok/s at full load),
 # which is the right trade for batch/agentic work. Lower it to 8-16 if you ever want the
 # endpoint tuned for interactive use instead.
 MAX_SEQS=${MAX_SEQS:-32}
@@ -78,8 +78,11 @@ KV_DTYPE=${KV_DTYPE:-fp8}
 # memory, "GPU total" is the whole 119.6 GiB machine and vLLM's headroom check falls
 # back to host-wide /proc/meminfo, which cannot see the slurm --mem cgroup at all.
 # A fixed byte count is identical across every requeue and skips the profiling pass.
-# 60 GiB; vLLM measured 60.73 GiB available at util=0.75.
-KV_CACHE_BYTES=${KV_CACHE_BYTES:-64424509440}
+# 71 GiB = ~2.0M tokens at fp8 (37.2 KiB/token measured, job 611). Sized to leave
+# ~10 GiB host headroom: weights ~22 GiB + this pool + ~16 GiB runtime on the
+# 119.6 GiB unified box. Do not push further without remembering the OOM killer
+# shares this memory (FlashInfer JIT rebuilds after upgrades cost several GiB).
+KV_CACHE_BYTES=${KV_CACHE_BYTES:-76235669504}
 # MUST still be set explicitly. kv_cache_memory_bytes ignores gpu_memory_utilization when
 # *sizing* the pool, but v1/worker/utils.py:414 still gates startup on
 #   free_memory >= total_memory * gpu_memory_utilization

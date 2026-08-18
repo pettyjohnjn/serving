@@ -220,7 +220,7 @@ canvas{width:100%;height:190px;display:block}
 <div class="card"><div class="v" id="pre">–</div><div class="l">prefill tok/s (whole box)</div></div>
 <div class="card"><div class="v" id="run">–</div><div class="l">requests in flight</div></div>
 <div class="card"><div class="v" id="wait">–</div><div class="l">queued (past the cap of 32)</div></div>
-<div class="card"><div class="v" id="kv">–</div><div class="l">KV cache used (1.7M-token pool)</div></div>
+<div class="card"><div class="v" id="kv">–</div><div class="l">KV cache used (2M-token pool)</div></div>
 <div class="card"><div class="v" id="hit">–</div><div class="l">prefix cache hit rate (lifetime)</div></div>
 <div class="card"><div class="v" id="gpu">–</div><div class="l">GPU utilisation (globus3)</div></div>
 <div class="card"><div class="v" id="mem">–</div><div class="l">node memory (unified — this IS GPU memory)</div></div>
