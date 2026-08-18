@@ -261,14 +261,21 @@ h1{font-size:1.3rem;margin:0;letter-spacing:-.01em}
 .strip i{flex:1 1 0;max-width:7px;border-radius:2px;background:var(--nodata);cursor:default}
 .strip i.ok{background:var(--ok)}.strip i.warn{background:var(--warn)}.strip i.down{background:var(--down)}
 .axis{display:flex;justify-content:space-between;color:var(--muted);font-size:.72rem;margin-top:.4rem}
-.comp{padding:0}
-.comp .row{display:flex;align-items:center;gap:.6rem;padding:.7rem 1rem;border-top:1px solid var(--border);font-size:.9rem}
-.comp .row:first-child{border-top:0}
+.comp{margin-top:.8rem;border-top:1px solid var(--border)}
+.comp .row{display:flex;align-items:baseline;gap:.6rem;padding:.55rem 0 0;font-size:.9rem}
+.comp .row .sub{color:var(--muted);font-size:.78rem}
 .comp .st{margin-left:auto;display:flex;align-items:center;gap:.45em;font-size:.8rem;color:var(--muted)}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(10.2rem,1fr));gap:.7rem}
-.m .v{font:600 1.35rem/1.25 ui-monospace,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
+.m .v{font:600 1.3rem/1.25 ui-monospace,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
 .m .l{color:var(--muted);font-size:.78rem;margin-top:.15rem}
-.chart{margin-top:.7rem}
+.node{color:var(--muted);font-size:.82rem;margin-top:.7rem;font-variant-numeric:tabular-nums}
+.utab{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;margin-bottom:1rem}
+.utab th,.utab td{padding:.4rem .5rem;text-align:right;font-size:.85rem}
+.utab th:first-child,.utab td:first-child{text-align:left}
+.utab th{color:var(--muted);font-weight:500;font-size:.7rem;text-transform:uppercase;letter-spacing:.07em}
+.utab td{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.83rem}
+.utab td:first-child{font-family:inherit;color:var(--muted)}
+.utab tbody tr td{border-top:1px solid var(--border)}
 .chead{display:flex;align-items:center;margin-bottom:.5rem;font-size:.8rem;color:var(--muted)}
 .legend i{display:inline-block;width:.65em;height:.65em;border-radius:2px;margin:0 .35em 0 .9em;background:var(--chart1)}
 .legend i.pf{background:var(--chart2)}
@@ -285,52 +292,39 @@ footer{color:var(--muted);font-size:.78rem;margin-top:2rem;line-height:1.7}
 <div class="bsub" id="bsub">this page auto-refreshes every 2 s</div></div>
 
 <div class="eyebrow">Availability<span class="r" id="upcts"></span></div>
-<div class="card"><div class="strip" id="strip"></div>
-<div class="axis"><span id="ax0">90 days ago</span><span>today</span></div></div>
+<div class="card">
+<div class="strip" id="strip"></div>
+<div class="axis"><span>90 days ago</span><span>today</span></div>
+<div class="comp">
+<div class="row">Inference engine<span class="sub">vLLM on globus3</span><span class="st"><span class="dot" id="c-eng"></span><span id="t-eng">–</span></span></div>
+<div class="row">Fairness gateway<span class="sub">API, port 8000</span><span class="st"><span class="dot" id="c-gw"></span><span id="t-gw">–</span></span></div>
+<div class="row">Web UI<span class="sub">chat, port 8080</span><span class="st"><span class="dot" id="c-web"></span><span id="t-web">–</span></span></div>
+</div></div>
 
-<div class="eyebrow">Components</div>
-<div class="card comp">
-<div class="row">Inference engine <span class="sm" style="color:var(--muted);font-size:.78rem">vLLM on globus3</span><span class="st"><span class="dot" id="c-eng"></span><span id="t-eng">–</span></span></div>
-<div class="row">Fairness gateway <span style="color:var(--muted);font-size:.78rem">API :8000</span><span class="st"><span class="dot" id="c-gw"></span><span id="t-gw">–</span></span></div>
-<div class="row">Web UI <span style="color:var(--muted);font-size:.78rem">chat :8080</span><span class="st"><span class="dot" id="c-web"></span><span id="t-web">–</span></span></div>
-</div>
-
-<div class="eyebrow">Serving right now</div>
+<div class="eyebrow">Serving now</div>
 <div class="grid">
-<div class="card m"><div class="v" id="gen">–</div><div class="l">generation tok/s, whole box</div></div>
-<div class="card m"><div class="v" id="pre">–</div><div class="l">prefill tok/s, whole box</div></div>
-<div class="card m"><div class="v" id="ttft">–</div><div class="l">time to first token, recent</div></div>
-<div class="card m"><div class="v" id="stream">–</div><div class="l">per-stream decode tok/s, recent</div></div>
-<div class="card m"><div class="v" id="run">–</div><div class="l">requests in flight (32 slots)</div></div>
-<div class="card m"><div class="v" id="wait">–</div><div class="l">queued past the cap</div></div>
-<div class="card m"><div class="v" id="users">–</div><div class="l">users active now</div></div>
-<div class="card m"><div class="v" id="kv">–</div><div class="l">KV cache used (2M-token pool)</div></div>
+<div class="card m"><div class="v" id="gen">–</div><div class="l">generation tok/s</div></div>
+<div class="card m"><div class="v" id="pre">–</div><div class="l">prefill tok/s</div></div>
+<div class="card m"><div class="v" id="ttft">–</div><div class="l">time to first token</div></div>
+<div class="card m"><div class="v" id="stream">–</div><div class="l">per-stream tok/s</div></div>
+<div class="card m"><div class="v" id="run">–</div><div class="l">requests in flight</div></div>
+<div class="card m"><div class="v" id="wait">–</div><div class="l">queued</div></div>
+<div class="card m"><div class="v" id="users">–</div><div class="l">active users</div></div>
+<div class="card m"><div class="v" id="kv">–</div><div class="l">KV cache used</div></div>
 </div>
-
-<div class="eyebrow">Node — globus3</div>
-<div class="grid">
-<div class="card m"><div class="v" id="gpu">–</div><div class="l">GPU utilisation</div></div>
-<div class="card m"><div class="v" id="mem">–</div><div class="l">unified memory (this IS GPU memory)</div></div>
-<div class="card m"><div class="v" id="cpu">–</div><div class="l">CPU load, 1 min (20 cores)</div></div>
-</div>
+<div class="node" id="nodeline"></div>
 
 <div class="eyebrow">Usage</div>
-<div class="grid">
-<div class="card m"><div class="v" id="u24">–</div><div class="l">tokens, 24 h · <span id="u24s"></span></div></div>
-<div class="card m"><div class="v" id="u7">–</div><div class="l">tokens, 7 d · <span id="u7s"></span></div></div>
-<div class="card m"><div class="v" id="u30">–</div><div class="l">tokens, 30 d · <span id="u30s"></span></div></div>
-<div class="card m"><div class="v" id="ul">–</div><div class="l"><span id="uls">tokens, all time</span></div></div>
-<div class="card m"><div class="v" id="ureq">–</div><div class="l">requests, 24 h · <span id="ureqs"></span> all time</div></div>
-</div>
-<div class="card chart">
+<div class="card">
+<table class="utab"><thead><tr><th></th><th>tokens</th><th>decode</th><th>prefill</th><th>requests</th></tr></thead>
+<tbody id="utab"></tbody></table>
 <div class="chead"><span class="legend"><b>history</b><i></i>decode<i class="pf"></i>prefill</span>
 <span class="rng"><button data-r="24h" class="on">24 h</button><button data-r="7d">7 d</button><button data-r="30d">30 d</button></span></div>
 <canvas id="chart"></canvas>
 </div>
 
-<footer>qwen3.8-27b · NVFP4 · 262,144-token context per request · default reasoning effort medium<br>
-availability probed every 30 s from the login node · history since <span id="since">–</span> ·
-docs: <code>/shared/llm/QUICKSTART.md</code> on the cluster<br><span id="age"></span></footer>
+<footer>qwen3.8-27b · NVFP4 · 262,144-token context per request · availability probed every 30 s ·
+history since <span id="since">–</span> · docs: <code>/shared/llm/QUICKSTART.md</code><br><span id="age"></span></footer>
 </main><div id="tip"></div><script>
 const g=id=>document.getElementById(id);
 const tip=g('tip');
@@ -356,20 +350,22 @@ async function tick(){
   if(waiting>0||!web){
    banner.className='banner warn';setDot(g('pdot'),'warn');g('ptxt').textContent='degraded';
    g('bstate').textContent=waiting>0?'Operational — under load':'API operational — web UI down';
-   g('bsub').textContent=waiting>0?waiting+' request(s) queued past the 32-slot cap · new requests will wait briefly':'the OpenAI API works; the browser chat backend is not answering';
+   g('bsub').textContent=waiting>0?waiting+' request(s) queued — new requests will wait briefly':'the OpenAI API works; the browser chat backend is not answering';
   }else{
    banner.className='banner ok';setDot(g('pdot'),'ok');g('ptxt').textContent='operational';
    g('bstate').textContent='All systems operational';
-   g('bsub').textContent='updated '+new Date().toLocaleTimeString()+' · auto-refreshes every 2 s';
+   g('bsub').textContent='updated '+new Date().toLocaleTimeString()+' · refreshes every 2 s';
   }
-  g('run').textContent=Math.round(s.running??0);
+  g('run').textContent=Math.round(s.running??0)+' / 32';
   g('wait').textContent=waiting;
   g('kv').textContent=((s.kv_usage??0)*100).toFixed(1)+'%';
   if(s.fair&&s.fair.users!=null)g('users').textContent=s.fair.users;
   if(s.node){
-   if(s.node.gpu_util!=null)g('gpu').textContent=s.node.gpu_util+'%';
-   if(s.node.mem_used_gib!=null)g('mem').textContent=s.node.mem_used_gib.toFixed(0)+' / '+s.node.mem_total_gib.toFixed(0)+' GiB';
-   if(s.node.load1!=null)g('cpu').textContent=s.node.load1;
+   const n=s.node,parts=['globus3'];
+   if(n.gpu_util!=null)parts.push('GPU '+n.gpu_util+'%');
+   if(n.mem_used_gib!=null)parts.push('memory '+n.mem_used_gib.toFixed(0)+' / '+n.mem_total_gib.toFixed(0)+' GiB');
+   if(n.load1!=null)parts.push('CPU '+Math.round(100*parseFloat(n.load1)/20)+'%');
+   g('nodeline').textContent=parts.join(' · ');
   }
   if(prev&&s.t>prev.t){
    const dt=s.t-prev.t;
@@ -419,13 +415,14 @@ function strip(){
  g('upcts').textContent='24 h '+pct(usage.day.up,usage.day.total,1)+' · 30 d '+pct(usage.month.up,usage.month.total,2)+' · 90 d '+pct(up90,t90,2);
 }
 function cards(){
- const s=(id,w)=>{g(id).textContent=fmt(w.prompt+w.gen);g(id+'s').textContent=fmt(w.gen)+' decode / '+fmt(w.prompt)+' prefill'};
- s('u24',usage.day);s('u7',usage.week);s('u30',usage.month);
- const L=usage.lifetime;
- g('ul').textContent=fmt(L.prompt+L.gen);
- g('uls').textContent='tokens since '+new Date(usage.since*1000).toLocaleDateString()+' · '+fmt(L.gen)+' decode / '+fmt(L.prompt)+' prefill';
- g('ureq').textContent=fmt(usage.day.reqs??0);
- g('ureqs').textContent=fmt(L.reqs??0);
+ const tb=g('utab');tb.innerHTML='';
+ const rows=[['24 h',usage.day],['7 d',usage.week],['30 d',usage.month],['all time',usage.lifetime]];
+ for(const [name,w] of rows){
+  const tr=document.createElement('tr');
+  const cells=[name,fmt(w.prompt+w.gen),fmt(w.gen),fmt(w.prompt),fmt(w.reqs??0)];
+  tr.innerHTML=cells.map(c=>'<td>'+c+'</td>').join('');
+  tb.appendChild(tr);
+ }
  g('since').textContent=new Date(usage.since*1000).toLocaleDateString();
 }
 function draw(){
