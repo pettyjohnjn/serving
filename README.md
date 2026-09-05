@@ -69,3 +69,34 @@ fresh operator account.
 [DESIGN.md](DESIGN.md) holds the long version: why every configuration value is
 what it is, the measured performance tables, the security and privacy model, and
 the operational drills the failure numbers come from.
+
+## Model profiles
+
+The endpoint can serve more than one model. Everything model-specific lives in
+`etc/models/<profile>.env`: the weights path, the runtime that can load them, the
+tuned defaults, extra flags and extra environment. Everything else — the reverse
+tunnel, fair-proxy, the auth policy, draining and requeue — is shared.
+
+    sbatch bin/serve.sh                                          # qwen38-27b (default)
+    sbatch --export=ALL,MODEL_PROFILE=qwen38-flash-next bin/serve.sh
+
+The profile is sourced before the tunables in `serve.sh`, so those become fallbacks.
+Selecting `qwen38-27b` produces a byte-identical flag set to how the endpoint ran
+before profiles existed; `DRY_RUN=1 bin/serve.sh` prints the argv and exits, which is
+how that is checked without touching production.
+
+| | qwen38-27b | qwen38-flash-next |
+|---|---|---|
+| runtime | `venv2/bin/vllm` (0.27.1) | extracted official image, host python3.12 |
+| weights | `/scratch/models/Qwen3.8-27B-NVFP4` | `/scratch/hf/...-fp8hybrid` |
+| max seqs | 32 | 8 |
+| speculation | qwen3_5_mtp, 3 | mtp, 1 |
+| KV | fp8, pinned pool | bf16 |
+| tool parser | qwen3_xml | qwen3_coder |
+
+Flash-Next needs its runtime built and verified first:
+
+    ~/flash-next-eval/bin/fn build && ~/flash-next-eval/bin/fn verify
+
+The profile refuses to start if the weights or the prepared hybrid checkpoint are
+missing, rather than falling through to the 27B default.

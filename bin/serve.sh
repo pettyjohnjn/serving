@@ -25,6 +25,20 @@
 set -uo pipefail
 
 SERVING_ROOT=${SERVING_ROOT:-$HOME/serving}
+
+# ---- model profile ---------------------------------------------------------------
+# Everything model-specific lives in etc/models/<profile>.env: the model path, the
+# runtime that can load it, the tuned defaults and any extra flags/env. Sourced HERE,
+# before the tunables below, so those become fallbacks rather than overrides -- which
+# is what keeps the 27B path byte-identical to how it ran before profiles existed.
+#   sbatch --export=ALL,MODEL_PROFILE=qwen38-flash-next bin/serve.sh
+MODEL_PROFILE=${MODEL_PROFILE:-qwen38-27b}
+_PROFILE=$SERVING_ROOT/etc/models/$MODEL_PROFILE.env
+[ -r "$_PROFILE" ] || { echo "[$(date)] no such model profile: $_PROFILE"; exit 1; }
+. "$_PROFILE" || { echo "[$(date)] model profile $MODEL_PROFILE refused to load"; exit 1; }
+[ -n "${MODEL:-}" ] || { echo "[$(date)] profile $MODEL_PROFILE resolved no MODEL (weights missing?)"; exit 1; }
+echo "[$(date)] profile=$MODEL_PROFILE model=$MODEL served-as=$SERVED_NAME"
+
 MODEL=${MODEL:-/scratch/models/Qwen3.8-27B-NVFP4}
 PORT=${PORT:-8000}
 
@@ -136,7 +150,7 @@ fi
 
 SPEC_ARGS=()
 if [ "${SPEC_TOKENS:-0}" -gt 0 ] 2>/dev/null; then
-    SPEC_ARGS=(--speculative-config "{\"method\":\"qwen3_5_mtp\",\"num_speculative_tokens\":$SPEC_TOKENS}")
+    SPEC_ARGS=(--speculative-config "{\"method\":\"${SPEC_METHOD:-qwen3_5_mtp}\",\"num_speculative_tokens\":$SPEC_TOKENS}")
 fi
 if [ "$REQUIRE_API_KEY" = "1" ]; then
     # Via a --config file, never argv: /proc/<pid>/cmdline is world readable and this
@@ -177,7 +191,7 @@ export VLLM_DO_NOT_TRACK=1
 # FlashInfer JIT-compiles attention kernels at startup and shells out to `ninja` and `nvcc`.
 # Calling venv2/bin/vllm directly does not put venv2/bin on PATH, so ninja must be added
 # explicitly or the engine dies with FileNotFoundError: 'ninja' during memory profiling.
-export PATH="$SERVING_ROOT/venv2/bin:/usr/local/cuda/bin:$PATH"
+export PATH="${VLLM_PATH_PREPEND:+$VLLM_PATH_PREPEND:}/usr/local/cuda/bin:$PATH"
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 
 # Bound JIT build parallelism. ninja otherwise launches ~nproc nvcc processes, and each
@@ -199,7 +213,7 @@ NODE_IP=${NODE_IP:-$(hostname -I | awk '{print $1}')}
 # Done BEFORE binding, because binding loopback without a working tunnel would leave the
 # endpoint reachable by nobody. The forced command on the key exits 1; only ssh's own
 # 255 means the connection or authentication failed.
-if [ "$(hostname -s)" != "$PUBLISH_HOST" ]; then
+if [ "${DRY_RUN:-0}" != 1 ] && [ "$(hostname -s)" != "$PUBLISH_HOST" ]; then
     PUBLISH_OK=0
     if [ -f "$TUNNEL_KEY" ]; then
         ssh -i "$TUNNEL_KEY" -o IdentitiesOnly=yes -o IdentityAgent=none \
@@ -318,30 +332,37 @@ trap _on_term TERM
 # arguments at all, including losing --host and exposing the port publicly.
 # --served-model-name takes a list and each entry aliases the same weights; keep it to one
 # name, since advertising a '-nvfp4' variant made it look like a choice between two models.
-"$SERVING_ROOT/venv2/bin/vllm" serve "$MODEL" \
-    ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} \
-    --served-model-name qwen3.8-27b \
-    --host "$BIND_HOST" \
-    --port "$PORT" \
-    --max-model-len "$MAX_MODEL_LEN" \
-    --max-num-seqs "$MAX_SEQS" \
-    --max-num-batched-tokens "$MAX_BATCHED_TOKENS" \
-    --kv-cache-memory "$KV_CACHE_BYTES" \
-    --gpu-memory-utilization "$GPU_UTIL" \
-    --kv-cache-dtype "$KV_DTYPE" \
-    --enable-prefix-caching \
-    --async-scheduling \
-    ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"} \
-    --enable-auto-tool-choice \
-    --enable-force-include-usage \
-    --tool-call-parser qwen3_xml \
-    ${REASON_ARGS[@]+"${REASON_ARGS[@]}"} \
-    --default-chat-template-kwargs "{\"reasoning_effort\":\"$REASONING_EFFORT\"}" \
-    --limit-mm-per-prompt '{"image":4,"video":0}' \
-    --shutdown-timeout "$DRAIN_SECONDS" \
-    --allowed-media-domains blocked.invalid \
-    --disable-fastapi-docs \
-    --allowed-origins '[]' &
+profile_args
+MODEL_ARGV=("$MODEL"); [ "${MODEL_PASS:-positional}" = flag ] && MODEL_ARGV=(--model "$MODEL")
+
+VLLM_ARGV=(
+    "${VLLM_LAUNCH[@]}" "${MODEL_ARGV[@]}"
+    ${KEY_ARGS[@]+"${KEY_ARGS[@]}"}
+    --served-model-name "$SERVED_NAME"
+    --host "$BIND_HOST"
+    --port "$PORT"
+    --max-model-len "$MAX_MODEL_LEN"
+    --max-num-seqs "$MAX_SEQS"
+    --max-num-batched-tokens "$MAX_BATCHED_TOKENS"
+    --gpu-memory-utilization "$GPU_UTIL"
+    --enable-prefix-caching
+    ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"}
+    --enable-auto-tool-choice
+    --enable-force-include-usage
+    ${REASON_ARGS[@]+"${REASON_ARGS[@]}"}
+    "${PROFILE_ARGS[@]}"
+    --shutdown-timeout "$DRAIN_SECONDS"
+    --allowed-media-domains blocked.invalid
+    --disable-fastapi-docs
+    --allowed-origins '[]'
+)
+
+# DRY_RUN=1 prints the exact argv and exits. Used to prove a change to the profile
+# machinery leaves the 27B command line unchanged, without touching production.
+if [ "${DRY_RUN:-0}" = 1 ]; then printf '%s\n' "${VLLM_ARGV[@]}"; exit 0; fi
+
+profile_env
+"${VLLM_ARGV[@]}" &
 
 VLLM_PID=$!
 PUBLISHER_PID=""
