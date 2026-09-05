@@ -2,6 +2,7 @@
 """Smoke-test the endpoint: auth, generation, reasoning split, tool calling, vision."""
 import base64
 import json
+import os
 import sys
 import time
 
@@ -12,7 +13,23 @@ BASE = sys.argv[1] if len(sys.argv) > 1 else "http://globus3:8000/v1"
 # argv[2] made this crash with an IndexError in exactly the mode we ship.
 KEY = sys.argv[2] if len(sys.argv) > 2 else "sk-local"
 H = {"Authorization": f"Bearer {KEY}"}
-MODEL = "qwen3.8-27b"
+# The endpoint serves whichever profile was selected (see etc/models/), so the model
+# name cannot be hardcoded or this suite fails on every model but one. Ask the server.
+# SMOKE_MODEL overrides, e.g. to target one entry on a multi-model endpoint.
+def _served_model():
+    if os.environ.get("SMOKE_MODEL"):
+        return os.environ["SMOKE_MODEL"]
+    try:
+        ids = [m["id"] for m in
+               httpx.get(f"{BASE}/models", headers=H, timeout=30).json().get("data", [])]
+        if ids:
+            return ids[0]
+    except Exception:
+        pass
+    return "qwen3.8-27b"
+
+
+MODEL = _served_model()
 
 
 def post(payload, timeout=300):
@@ -33,9 +50,13 @@ def check(name, fn):
 
 
 def t_models():
+    """Asserts the endpoint lists at least one model and that it is the one this run
+    targets. Not tautological even though MODEL is discovered: discovery falls back to
+    a literal when /models is unreachable, and SMOKE_MODEL can name a model that is
+    not actually served."""
     r = httpx.get(f"{BASE}/models", headers=H, timeout=30)
     ids = [m["id"] for m in r.json().get("data", [])]
-    return MODEL in ids, f"served: {ids}"
+    return bool(ids) and MODEL in ids, f"testing {MODEL!r}; served: {ids}"
 
 
 def t_auth_rejected():
