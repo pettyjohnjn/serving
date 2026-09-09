@@ -37,6 +37,15 @@ _PROFILE=$SERVING_ROOT/etc/models/$MODEL_PROFILE.env
 [ -r "$_PROFILE" ] || { echo "[$(date)] no such model profile: $_PROFILE"; exit 1; }
 . "$_PROFILE" || { echo "[$(date)] model profile $MODEL_PROFILE refused to load"; exit 1; }
 [ -n "${MODEL:-}" ] || { echo "[$(date)] profile $MODEL_PROFILE resolved no MODEL (weights missing?)"; exit 1; }
+# Assert the profile contract. Without this a profile that forgets profile_args()
+# still launches -- with every model-specific flag silently absent (no kv-cache-dtype,
+# no tool-call-parser). A subtly wrong server that passes `doctor` is the worst
+# outcome available here, so fail before binding anything.
+[ -n "${SERVED_NAME:-}" ] || { echo "[$(date)] profile $MODEL_PROFILE sets no SERVED_NAME"; exit 1; }
+declare -p VLLM_LAUNCH >/dev/null 2>&1 || { echo "[$(date)] profile $MODEL_PROFILE sets no VLLM_LAUNCH"; exit 1; }
+for _f in profile_args profile_env; do
+    declare -F "$_f" >/dev/null || { echo "[$(date)] profile $MODEL_PROFILE defines no $_f()"; exit 1; }
+done
 echo "[$(date)] profile=$MODEL_PROFILE model=$MODEL served-as=$SERVED_NAME"
 
 MODEL=${MODEL:-/scratch/models/Qwen3.8-27B-NVFP4}
@@ -350,7 +359,7 @@ VLLM_ARGV=(
     --enable-auto-tool-choice
     --enable-force-include-usage
     ${REASON_ARGS[@]+"${REASON_ARGS[@]}"}
-    "${PROFILE_ARGS[@]}"
+    ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}
     --shutdown-timeout "$DRAIN_SECONDS"
     --allowed-media-domains blocked.invalid
     --disable-fastapi-docs

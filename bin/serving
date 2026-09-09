@@ -21,8 +21,31 @@ COMPUTE_NODE=${COMPUTE_NODE:-globus3}
 LOGIN_FQDN=${LOGIN_FQDN:-}
 JOB=qwen38-serve
 PORT=8000
+# Which model this endpoint serves. Set MODEL_PROFILE in etc/site.env; it must reach
+# the job explicitly, because `supervise` resubmits from a systemd timer whose
+# environment has nothing in it.
+MODEL_PROFILE=${MODEL_PROFILE:-qwen38-27b}
+PROFILE_FILE=$ROOT/etc/models/$MODEL_PROFILE.env
+# Scheduler knobs cannot come from #SBATCH (static) or from sourcing the profile
+# (it resolves weights and may refuse), so read exactly those two assignments.
+PROFILE_SBATCH=()
+PROFILE_COLDSTART=720
+if [ -r "$PROFILE_FILE" ]; then
+    eval "$(grep -E '^PROFILE_(SBATCH|COLDSTART)=' "$PROFILE_FILE")"
+fi
+# A missing profile must NOT disable diagnostics: status/doctor/logs/test are exactly
+# what an operator reaches for when a deploy went wrong. Only the commands that submit
+# a job insist on it.
+require_profile () {
+    [ -r "$PROFILE_FILE" ] && return 0
+    echo "serving: no such model profile: $PROFILE_FILE" >&2
+    echo "         set MODEL_PROFILE in etc/site.env, or deploy etc/models/" >&2
+    exit 1
+}
+
 SBATCH_ARGS=(-w "$COMPUTE_NODE" -o "$ROOT/logs/serve-%j.out" -e "$ROOT/logs/serve-%j.out"
-             --export=ALL,SERVING_ROOT="$ROOT")
+             ${PROFILE_SBATCH[@]+"${PROFILE_SBATCH[@]}"}
+             --export=ALL,SERVING_ROOT="$ROOT",MODEL_PROFILE="$MODEL_PROFILE")
 KEYS=$ROOT/etc/keys.env
 EP=$ROOT/etc/endpoint.json
 KEEP_LOGS=${KEEP_LOGS:-15}
@@ -86,24 +109,41 @@ lint_serve_script() {
     python3 - "$ROOT/bin/serve.sh" <<'PYEOF'
 import re, sys
 lines = open(sys.argv[1]).read().split("\n")
+
+# The command used to be a backslash-continued literal anchored on
+# `"$SERVING_ROOT/venv2/bin/vllm" serve`. It is now an array, because the runtime
+# differs per model profile (the 27B's venv cannot load Flash-Next). The gate keeps
+# its purpose: prove the flags that make this endpoint safe actually reach vllm.
 try:
-    start = next(i for i, l in enumerate(lines) if l.startswith('"$SERVING_ROOT/venv2/bin/vllm" serve'))
+    start = next(i for i, l in enumerate(lines) if l.startswith("VLLM_ARGV=("))
 except StopIteration:
-    sys.exit("lint: could not find the vllm serve command")
-i, flags, bad = start, [], []
-while True:
+    sys.exit("lint: could not find the VLLM_ARGV assembly in serve.sh")
+i, flags, depth = start, [], 0
+while i < len(lines):
     l = lines[i]
-    if i > start and l.lstrip().startswith("#"):
-        bad.append(f"  line {i+1}: {l.strip()[:70]}")
+    depth += l.count("(") - l.count(")")
     flags += re.findall(r"--[a-z0-9-]+", l)
-    if not l.rstrip().endswith("\\"):
+    if depth <= 0 and i > start:
         break
     i += 1
-if bad:
-    sys.exit("lint: comment inside the continued vllm command truncates it:\n" + "\n".join(bad))
+else:
+    sys.exit("lint: VLLM_ARGV=( is never closed")
+
+# Flags that live in the profile rather than the shared array. Absent here on purpose;
+# serve.sh asserts the profile defines profile_args()/profile_env() before binding.
 for required in ("--host", "--served-model-name", "--port"):
     if required not in flags:
-        sys.exit(f"lint: {required} never reaches vllm (command truncated?)")
+        sys.exit(f"lint: {required} never reaches vllm (array truncated?)")
+
+# The array is useless if nothing executes it, and a stray edit that drops the
+# expansion would start NOTHING while every other check still passed.
+if not any(re.search(r'"\$\{VLLM_ARGV\[@\]\}"', l) for l in lines):
+    sys.exit("lint: VLLM_ARGV is assembled but never executed")
+
+# The profile decides the runtime, so a profile that sets no launcher would expand to
+# an empty command. serve.sh checks at run time; check the contract exists at all.
+if not any(l.strip().startswith("declare -p VLLM_LAUNCH") for l in lines):
+    sys.exit("lint: serve.sh no longer asserts the profile sets VLLM_LAUNCH")
 PYEOF
 }
 
@@ -118,9 +158,13 @@ cmd_start() {
     fi
     # keys.env is only needed when REQUIRE_API_KEY=1; SSH-only mode needs no secret.
     rotate_logs
+    require_profile
     local out; out=$(cd "$ROOT" && sbatch "${SBATCH_ARGS[@]}" bin/serve.sh 2>&1) || die "$out"
     info "$out"
-    wait_ready 900 && cmd_status
+    # Derived from the profile, not fixed at 900: Flash-Next boots in 700-800 s, so a
+    # flat 900 leaves ~100 s of margin and a slow boot reports a false failure while
+    # the job is in fact fine. 27B keeps its effective 900 (720 + 180).
+    wait_ready $((PROFILE_COLDSTART + 180)) && cmd_status
 }
 
 cmd_stop() {
@@ -394,12 +438,15 @@ cmd_supervise() {
         # reset by a requeue and is therefore the honest signal.
         local mins; mins=$(squeue -h -j "$(job_id)" -o '%M' 2>/dev/null)
         secs=$(awk -F: '{n=NF; s=$n; if(n>1) s+=60*$(n-1); if(n>2) s+=3600*$(n-2); print s}' <<<"${mins:-0:00}")
-        [ "${secs:-0}" -lt 720 ] && exit 0          # under 12 min: still cold-starting
+        # Cold-boot grace comes from the profile: the 27B loads in well under 12 min,
+        # Flash-Next takes 700-800 s and would otherwise be restarted mid-boot in a loop.
+        [ "${secs:-0}" -lt "$PROFILE_COLDSTART" ] && exit 0
         supervise_attempt "unhealthy (http ${code:-000})" || exit 0
         cmd_restart >> "$ROOT/logs/supervise.log" 2>&1
         exit 0
     fi
     supervise_attempt "no job present" || exit 0
+    require_profile
     (cd "$ROOT" && sbatch "${SBATCH_ARGS[@]}" bin/serve.sh) >> "$ROOT/logs/supervise.log" 2>&1
 }
 
