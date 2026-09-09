@@ -33,6 +33,15 @@ PROFILE_COLDSTART=720
 if [ -r "$PROFILE_FILE" ]; then
     eval "$(grep -E '^PROFILE_(SBATCH|COLDSTART)=' "$PROFILE_FILE")"
 fi
+# A missing profile must NOT disable diagnostics: status/doctor/logs/test are exactly
+# what an operator reaches for when a deploy went wrong. Only the commands that submit
+# a job insist on it.
+require_profile () {
+    [ -r "$PROFILE_FILE" ] && return 0
+    echo "serving: no such model profile: $PROFILE_FILE" >&2
+    echo "         set MODEL_PROFILE in etc/site.env, or deploy etc/models/" >&2
+    exit 1
+}
 
 SBATCH_ARGS=(-w "$COMPUTE_NODE" -o "$ROOT/logs/serve-%j.out" -e "$ROOT/logs/serve-%j.out"
              ${PROFILE_SBATCH[@]+"${PROFILE_SBATCH[@]}"}
@@ -132,9 +141,13 @@ cmd_start() {
     fi
     # keys.env is only needed when REQUIRE_API_KEY=1; SSH-only mode needs no secret.
     rotate_logs
+    require_profile
     local out; out=$(cd "$ROOT" && sbatch "${SBATCH_ARGS[@]}" bin/serve.sh 2>&1) || die "$out"
     info "$out"
-    wait_ready 900 && cmd_status
+    # Derived from the profile, not fixed at 900: Flash-Next boots in 700-800 s, so a
+    # flat 900 leaves ~100 s of margin and a slow boot reports a false failure while
+    # the job is in fact fine. 27B keeps its effective 900 (720 + 180).
+    wait_ready $((PROFILE_COLDSTART + 180)) && cmd_status
 }
 
 cmd_stop() {
@@ -416,6 +429,7 @@ cmd_supervise() {
         exit 0
     fi
     supervise_attempt "no job present" || exit 0
+    require_profile
     (cd "$ROOT" && sbatch "${SBATCH_ARGS[@]}" bin/serve.sh) >> "$ROOT/logs/supervise.log" 2>&1
 }
 
