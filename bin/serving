@@ -21,8 +21,22 @@ COMPUTE_NODE=${COMPUTE_NODE:-globus3}
 LOGIN_FQDN=${LOGIN_FQDN:-}
 JOB=qwen38-serve
 PORT=8000
+# Which model this endpoint serves. Set MODEL_PROFILE in etc/site.env; it must reach
+# the job explicitly, because `supervise` resubmits from a systemd timer whose
+# environment has nothing in it.
+MODEL_PROFILE=${MODEL_PROFILE:-qwen38-27b}
+PROFILE_FILE=$ROOT/etc/models/$MODEL_PROFILE.env
+# Scheduler knobs cannot come from #SBATCH (static) or from sourcing the profile
+# (it resolves weights and may refuse), so read exactly those two assignments.
+PROFILE_SBATCH=()
+PROFILE_COLDSTART=720
+if [ -r "$PROFILE_FILE" ]; then
+    eval "$(grep -E '^PROFILE_(SBATCH|COLDSTART)=' "$PROFILE_FILE")"
+fi
+
 SBATCH_ARGS=(-w "$COMPUTE_NODE" -o "$ROOT/logs/serve-%j.out" -e "$ROOT/logs/serve-%j.out"
-             --export=ALL,SERVING_ROOT="$ROOT")
+             ${PROFILE_SBATCH[@]+"${PROFILE_SBATCH[@]}"}
+             --export=ALL,SERVING_ROOT="$ROOT",MODEL_PROFILE="$MODEL_PROFILE")
 KEYS=$ROOT/etc/keys.env
 EP=$ROOT/etc/endpoint.json
 KEEP_LOGS=${KEEP_LOGS:-15}
@@ -394,7 +408,9 @@ cmd_supervise() {
         # reset by a requeue and is therefore the honest signal.
         local mins; mins=$(squeue -h -j "$(job_id)" -o '%M' 2>/dev/null)
         secs=$(awk -F: '{n=NF; s=$n; if(n>1) s+=60*$(n-1); if(n>2) s+=3600*$(n-2); print s}' <<<"${mins:-0:00}")
-        [ "${secs:-0}" -lt 720 ] && exit 0          # under 12 min: still cold-starting
+        # Cold-boot grace comes from the profile: the 27B loads in well under 12 min,
+        # Flash-Next takes 700-800 s and would otherwise be restarted mid-boot in a loop.
+        [ "${secs:-0}" -lt "$PROFILE_COLDSTART" ] && exit 0
         supervise_attempt "unhealthy (http ${code:-000})" || exit 0
         cmd_restart >> "$ROOT/logs/supervise.log" 2>&1
         exit 0
