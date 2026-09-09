@@ -109,24 +109,41 @@ lint_serve_script() {
     python3 - "$ROOT/bin/serve.sh" <<'PYEOF'
 import re, sys
 lines = open(sys.argv[1]).read().split("\n")
+
+# The command used to be a backslash-continued literal anchored on
+# `"$SERVING_ROOT/venv2/bin/vllm" serve`. It is now an array, because the runtime
+# differs per model profile (the 27B's venv cannot load Flash-Next). The gate keeps
+# its purpose: prove the flags that make this endpoint safe actually reach vllm.
 try:
-    start = next(i for i, l in enumerate(lines) if l.startswith('"$SERVING_ROOT/venv2/bin/vllm" serve'))
+    start = next(i for i, l in enumerate(lines) if l.startswith("VLLM_ARGV=("))
 except StopIteration:
-    sys.exit("lint: could not find the vllm serve command")
-i, flags, bad = start, [], []
-while True:
+    sys.exit("lint: could not find the VLLM_ARGV assembly in serve.sh")
+i, flags, depth = start, [], 0
+while i < len(lines):
     l = lines[i]
-    if i > start and l.lstrip().startswith("#"):
-        bad.append(f"  line {i+1}: {l.strip()[:70]}")
+    depth += l.count("(") - l.count(")")
     flags += re.findall(r"--[a-z0-9-]+", l)
-    if not l.rstrip().endswith("\\"):
+    if depth <= 0 and i > start:
         break
     i += 1
-if bad:
-    sys.exit("lint: comment inside the continued vllm command truncates it:\n" + "\n".join(bad))
+else:
+    sys.exit("lint: VLLM_ARGV=( is never closed")
+
+# Flags that live in the profile rather than the shared array. Absent here on purpose;
+# serve.sh asserts the profile defines profile_args()/profile_env() before binding.
 for required in ("--host", "--served-model-name", "--port"):
     if required not in flags:
-        sys.exit(f"lint: {required} never reaches vllm (command truncated?)")
+        sys.exit(f"lint: {required} never reaches vllm (array truncated?)")
+
+# The array is useless if nothing executes it, and a stray edit that drops the
+# expansion would start NOTHING while every other check still passed.
+if not any(re.search(r'"\$\{VLLM_ARGV\[@\]\}"', l) for l in lines):
+    sys.exit("lint: VLLM_ARGV is assembled but never executed")
+
+# The profile decides the runtime, so a profile that sets no launcher would expand to
+# an empty command. serve.sh checks at run time; check the contract exists at all.
+if not any(l.strip().startswith("declare -p VLLM_LAUNCH") for l in lines):
+    sys.exit("lint: serve.sh no longer asserts the profile sets VLLM_LAUNCH")
 PYEOF
 }
 
