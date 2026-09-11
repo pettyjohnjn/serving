@@ -15,6 +15,13 @@ companion proxies, and keeps a read-only copy of the user-facing files fresh in
 `/shared/llm` (with the real login hostname substituted for the `<login-node>`
 placeholder the repo carries).
 
+**Choosing which model to serve.** `serving start` and `serving restart` take an
+optional profile name (`serving restart qwen38-flash-next`), and the choice is recorded
+in `logs/.model-profile` so the supervisor's argument-less resubmits do not undo it.
+`serving status` reports the active profile and flags an override of the configured
+default. Profiles are defined in `etc/models/<profile>.env`; an unknown name is refused
+before anything is stopped, and the available profiles are listed.
+
 **If the operator is unavailable** and the endpoint breaks in a way supervise cannot
 fix, any colleague can stand up their own instance rather than needing access to this
 one: clone the repo, `bin/setup_reverse_tunnel.sh` once (own tunnel key), fill in
@@ -506,6 +513,7 @@ serving/
 ├── bin/patch_vllm_gdn_sm120.sh  # re-apply after vLLM upgrades (see kernel section)
 ├── examples/                    # what to hand users: ALCF-style module, API demos, opencode config
 ├── ansible/                     # rebuild the stack on a fresh operator account (see its README)
+├── etc/models/                  # one .env per servable model; `serving start <name>`
 ├── etc/keys.env                 # per-user API keys (600)
 ├── etc/vllm-keys.yaml           # generated from keys.env; keeps keys out of argv (600)
 ├── etc/endpoint.json            # written at startup: node, bind, and the client URL
