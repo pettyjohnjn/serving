@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
-# serving — single entrypoint for the Qwen3.8-27B endpoint.
+# serving — single entrypoint for the inference endpoint.
 #
-#   serving start        launch the slurm job (refuses if one is already up)
-#   serving stop         drain in-flight requests, then stop
-#   serving restart      stop, wait for memory to be released, start
+#   serving start [model]    launch the slurm job (refuses if one is already up)
+#   serving stop             drain in-flight requests, then stop
+#   serving restart [model]  stop, wait for memory to be released, start
+#
+# [model] selects a profile from etc/models/ and STICKS: the choice is remembered so
+# that `supervise`, which resubmits from a timer with no arguments, brings back the same
+# model. `status` shows which is active.
+#   serving restart qwen38-flash-next
+#   serving restart qwen38-27b            # rollback
+#
+# The selection sticks even if the launch then fails -- an operator who asked for a model
+# should not get the other one back silently. `supervise` will retry it and give up per
+# SUPER_MAX rather than quietly serving something else.
 #   serving status       job state, reachability, live load, MTP acceptance
 #   serving logs [-f]    show (or follow) the current job's log
 #   serving test         smoke-test the running endpoint
@@ -17,6 +27,10 @@ ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 # Site-specific names (compute node, public login FQDN) live in etc/site.env,
 # which is git-ignored — copy etc/site.env.example and fill it in.
 [ -f "$ROOT/etc/site.env" ] && . "$ROOT/etc/site.env"
+# site.env is Ansible-managed; keep its value as the DECLARED default so an
+# operator override in logs/.model-profile wins until someone clears it.
+SITE_MODEL_PROFILE=${MODEL_PROFILE:-}
+unset MODEL_PROFILE
 COMPUTE_NODE=${COMPUTE_NODE:-globus3}
 LOGIN_FQDN=${LOGIN_FQDN:-}
 JOB=qwen38-serve
@@ -24,8 +38,43 @@ PORT=8000
 # Which model this endpoint serves. Set MODEL_PROFILE in etc/site.env; it must reach
 # the job explicitly, because `supervise` resubmits from a systemd timer whose
 # environment has nothing in it.
-MODEL_PROFILE=${MODEL_PROFILE:-qwen38-27b}
+# Which model this endpoint serves, in precedence order:
+#   1. the argument to `serving start|restart <profile>`
+#   2. logs/.model-profile -- what a previous such command selected
+#   3. MODEL_PROFILE from etc/site.env (Ansible-managed, the declared default)
+#   4. qwen38-27b
+# (2) exists because `supervise` resubmits from a systemd timer with no arguments: if the
+# selection lived only in argv, the next supervised restart would silently bring back the
+# OTHER model. It is a deliberate operator override of (3), so `status` reports the drift.
+# It is NOT in etc/ because that directory is Ansible-managed and `make apply` would
+# revert it mid-incident.
+PROFILE_STATE=$ROOT/logs/.model-profile
+MODEL_PROFILE=${MODEL_PROFILE:-}
+if [ -z "$MODEL_PROFILE" ] && [ -s "$PROFILE_STATE" ]; then
+    MODEL_PROFILE=$(tr -d '[:space:]' < "$PROFILE_STATE")
+fi
+MODEL_PROFILE=${MODEL_PROFILE:-${SITE_MODEL_PROFILE:-qwen38-27b}}
 PROFILE_FILE=$ROOT/etc/models/$MODEL_PROFILE.env
+
+# Switch the selection. Validates first: naming a profile that does not exist must fail
+# here, not after the endpoint is already down.
+select_profile() {
+    local want=$1
+    [ -r "$ROOT/etc/models/$want.env" ] || {
+        echo "serving: no such model profile '$want'" >&2
+        echo "         available: $(cd "$ROOT/etc/models" 2>/dev/null && ls *.env 2>/dev/null | sed 's/\.env$//' | tr '\n' ' ')" >&2
+        exit 1
+    }
+    MODEL_PROFILE=$want
+    PROFILE_FILE=$ROOT/etc/models/$want.env
+    PROFILE_SBATCH=(); PROFILE_COLDSTART=720
+    eval "$(grep -E '^PROFILE_(SBATCH|COLDSTART)=' "$PROFILE_FILE")"
+    SBATCH_ARGS=(-w "$COMPUTE_NODE" -o "$ROOT/logs/serve-%j.out" -e "$ROOT/logs/serve-%j.out"
+                 ${PROFILE_SBATCH[@]+"${PROFILE_SBATCH[@]}"}
+                 --export=ALL,SERVING_ROOT="$ROOT",MODEL_PROFILE="$MODEL_PROFILE")
+    mkdir -p "$ROOT/logs"
+    printf '%s\n' "$want" > "$PROFILE_STATE"
+}
 # Scheduler knobs cannot come from #SBATCH (static) or from sourcing the profile
 # (it resolves weights and may refuse), so read exactly those two assignments.
 PROFILE_SBATCH=()
@@ -73,7 +122,11 @@ job_node()  { job_line | awk '{print $3}'; }
 LOCK="$ROOT/logs/.serving.lock"
 take_lock() {  # $1 = "wait" | "nowait"
     mkdir -p "$ROOT/logs" 2>/dev/null
-    exec 9>"$LOCK" 2>/dev/null || return 0
+    # `|| return 0` used to report the lock as TAKEN when opening it failed -- e.g. when
+    # logs/ is not writable by the caller. Every lifecycle command then ran unserialised,
+    # and the SUPER_STATE writes failed silently too, so the SUPER_MAX give-up guard never
+    # fired. Fail closed instead: no lock, no action.
+    exec 9>"$LOCK" 2>/dev/null || { echo "cannot open $LOCK -- refusing to proceed" >&2; return 1; }
     if [ "${1:-wait}" = "nowait" ]; then flock -n 9 2>/dev/null || return 1
     else flock -w 600 9 2>/dev/null || return 1; fi
     return 0
@@ -148,6 +201,7 @@ PYEOF
 }
 
 cmd_start() {
+    [ -n "${1:-}" ] && select_profile "$1"
     take_lock wait || die "another serving operation is in progress"
     rm -f "$ROOT/logs/.paused"
     lint_serve_script || die "refusing to start: serve.sh would launch vllm with missing flags"
@@ -201,6 +255,7 @@ cmd_stop() {
 }
 
 cmd_restart() {
+    [ -n "${1:-}" ] && select_profile "$1"
     # cmd_stop/cmd_start each take the lock; flock on the same fd in the same shell is
     # re-entrant, so this is safe and keeps the whole cycle exclusive.
     take_lock wait || die "another serving operation is in progress"
@@ -214,7 +269,7 @@ cmd_restart() {
         [ -z "$(job_state)" ] && [ "$i" -ge 20 ] && break
     done
     printf ' done\n'
-    cmd_start
+    cmd_start "$@"
 }
 
 cmd_status() {
@@ -234,6 +289,10 @@ cmd_status() {
 
     printf '\n%s=== reachability (this host) ===%s\n' "$c_dim" "$c_off"
     code=$(health)
+    printf '  model profile        %s%s%s%s\n' "$c_grn" "$MODEL_PROFILE" "$c_off" \
+        "$([ -n "${SITE_MODEL_PROFILE:-}" ] && [ "$MODEL_PROFILE" != "$SITE_MODEL_PROFILE" ] \
+            && printf '  (operator override; Ansible declares %s -- clear with: rm %s)' \
+                      "$SITE_MODEL_PROFILE" "$PROFILE_STATE")"
     if [ "$code" = "200" ]; then printf '  /health              %s200%s\n' "$c_grn" "$c_off"
     else printf '  /health              %s%s%s  (endpoint not answering)\n' "$c_red" "${code:-000}" "$c_off"; fi
     local nokey; nokey=$(curl -s -m 8 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/v1/models")
