@@ -9,7 +9,7 @@
 #SBATCH --signal=B:USR1@300
 #SBATCH --open-mode=append
 
-# vLLM OpenAI-compatible endpoint for Qwen3.8-27B (NVFP4) on a DGX Spark GB10.
+# vLLM OpenAI-compatible endpoint on a DGX Spark GB10; the model comes from etc/models/.
 #
 # Design notes (see README.md for the full reasoning):
 #   * NVFP4 weights  -> ~23 GB, native Blackwell FP4 tensor cores. Decode on this
@@ -276,7 +276,8 @@ cat > "$SERVING_ROOT/etc/endpoint.json" <<EOF
   "published_at": "$PUBLISH_HOST:127.0.0.1:$PUBLISH_PORT",
   "client_base_url": "http://localhost:$CLIENT_PORT/v1",
   "client_tunnel": "ssh -N -L $CLIENT_PORT:127.0.0.1:$CLIENT_PORT $PUBLISH_HOST",
-  "model": "qwen3.8-27b",
+  "model": "$SERVED_NAME",
+  "profile": "$MODEL_PROFILE",
   "started": "$(date -Is)"
 }
 EOF

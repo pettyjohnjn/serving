@@ -11,3 +11,5 @@ webui-data/
 venv-webui/
 .webui_secret_key
 etc/site.env
+tools/flash-next/logs/
+tools/flash-next/flash-dgx/
