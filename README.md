@@ -77,7 +77,25 @@ The endpoint can serve more than one model. Everything model-specific lives in
 tuned defaults, extra flags and extra environment. Everything else — the reverse
 tunnel, fair-proxy, the auth policy, draining and requeue — is shared.
 
-    sbatch bin/serve.sh                                          # qwen38-27b (default)
+    serving start                       # the declared default (qwen38-27b)
+    serving restart qwen38-flash-next   # switch
+    serving restart qwen38-27b          # roll back
+
+The choice sticks. `serving supervise` resubmits from a timer with no arguments, so
+without a record of it the next supervised restart would quietly bring back the other
+model; it is written to `logs/.model-profile` instead. `serving status` always prints
+the active profile, and when it differs from `MODEL_PROFILE` in `etc/site.env` it says
+so rather than leaving the drift silent:
+
+    model profile        qwen38-flash-next  (operator override; Ansible declares
+                         qwen38-27b -- clear with: rm logs/.model-profile)
+
+That file lives in `logs/` and not `etc/` on purpose: under configuration management
+`etc/` is re-templated on every apply, and an apply must not revert an operator's
+choice in the middle of an incident.
+
+The lower-level form still works and is what `serve.sh` sees:
+
     sbatch --export=ALL,MODEL_PROFILE=qwen38-flash-next bin/serve.sh
 
 The profile is sourced before the tunables in `serve.sh`, so those become fallbacks.
