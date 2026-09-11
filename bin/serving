@@ -97,6 +97,11 @@ SBATCH_ARGS=(-w "$COMPUTE_NODE" -o "$ROOT/logs/serve-%j.out" -e "$ROOT/logs/serv
              --export=ALL,SERVING_ROOT="$ROOT",MODEL_PROFILE="$MODEL_PROFILE")
 KEYS=$ROOT/etc/keys.env
 EP=$ROOT/etc/endpoint.json
+# The served model name comes from the running job (endpoint.json), not from the
+# selected profile: for the length of a cold start after a switch the two differ.
+served_model () {
+    sed -n 's/.*"model": *"\([^"]*\)".*/\1/p' "$EP" 2>/dev/null | head -1 | grep . || echo '(see /v1/models)'
+}
 KEEP_LOGS=${KEEP_LOGS:-15}
 DRAIN_WAIT=${DRAIN_WAIT:-280}   # > serve.sh DRAIN_SECONDS(240) so a real drain can finish
 
@@ -339,7 +344,7 @@ cmd_status() {
 
     printf '\n%s=== clients ===%s\n' "$c_dim" "$c_off"
     printf '  tunnel   ssh -N -L %s:127.0.0.1:%s globus1\n' "$PORT" "$PORT"
-    printf '  base_url http://localhost:%s/v1     model  qwen3.8-27b\n' "$PORT"
+    printf '  base_url http://localhost:%s/v1     model  %s\n' "$PORT" "$(served_model)"
     printf '  browser  tunnel 8080 too, then http://localhost:8080\n\n'
 }
 

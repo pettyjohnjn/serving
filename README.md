@@ -94,6 +94,12 @@ That file lives in `logs/` and not `etc/` on purpose: under configuration manage
 `etc/` is re-templated on every apply, and an apply must not revert an operator's
 choice in the middle of an incident.
 
+The served model name changes with the profile (`qwen3.8-27b` becomes
+`qwen3.8-flash-next`), so a client that hardcodes a name breaks on a swap. The repo's
+own tooling (`serving status`, `chat.py`, `smoke.py`, the status page) asks the server
+instead. To keep one stable name across swaps, set `SERVED_NAME` in `etc/site.env`;
+it applies to whichever profile is running, so pick something model-neutral.
+
 The lower-level form still works and is what `serve.sh` sees:
 
     sbatch --export=ALL,MODEL_PROFILE=qwen38-flash-next bin/serve.sh
@@ -114,7 +120,7 @@ how that is checked without touching production.
 
 Flash-Next needs its runtime built and verified first:
 
-    ~/flash-next-eval/bin/fn build && ~/flash-next-eval/bin/fn verify
+    tools/flash-next/bin/fn build && tools/flash-next/bin/fn verify
 
 The profile refuses to start if the weights or the prepared hybrid checkpoint are
 missing, rather than falling through to the 27B default.

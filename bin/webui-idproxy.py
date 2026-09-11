@@ -199,6 +199,15 @@ def fetch_webui_ok():
 
 def stats_snapshot():
     out = {"t": time.time(), "up": False, "max_context": 262144}
+    # Which model is actually serving, written by the slurm job at startup. Not a
+    # constant: the endpoint serves whichever profile was selected.
+    try:
+        with open(ROOT + "/etc/endpoint.json") as f:
+            ep = json.load(f)
+        out["model"] = ep.get("model", "")
+        out["profile"] = ep.get("profile", "")
+    except (OSError, ValueError):
+        pass
     # GPU/host figures are written by the slurm job on the compute node every 10 s
     # (NFS-shared logs dir); stale entries mean the job is down or reloading.
     try:
@@ -331,7 +340,7 @@ footer{color:var(--muted);font-size:.78rem;margin-top:2rem;line-height:1.7}
 <canvas id="chart"></canvas>
 </div>
 
-<footer>qwen3.8-27b · NVFP4 · 262,144-token context per request · availability probed every 30 s ·
+<footer><span id="model">model</span> · 262,144-token context per request · availability probed every 30 s ·
 history since <span id="since">–</span> · docs: <code>/shared/llm/QUICKSTART.md</code><br><span id="age"></span></footer>
 </main><div id="tip"></div><script>
 const g=id=>document.getElementById(id);
@@ -343,6 +352,7 @@ let prev=null;
 async function tick(){
  try{
   const s=await (await fetch('/globus-stats.json',{cache:'no-store'})).json();
+  if(s.model)g('model').textContent=s.model;
   const eng=!!s.engine,gw=s.fair&&s.fair.ok,web=!!s.webui_ok;
   setDot(g('c-eng'),eng?'ok':'down');g('t-eng').textContent=eng?'operational':'down';
   setDot(g('c-gw'),gw?'ok':'down');g('t-gw').textContent=gw?'operational':'down';

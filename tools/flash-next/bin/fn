@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# fn — build and verify the Flash-Next runtime on the serving node.
+#
+#   fn build [--force]   image + patches + kernel + weights + hybrid checkpoint
+#   fn verify            assert every artifact is actually correct (content, not stamps)
+#   fn clean [--yes]     remove node-local build artifacts (weights kept)
+#
+# Serving and testing go through the production stack once verify is green:
+#   serving restart qwen38-flash-next     then     serving test
+#
+# Every stage is idempotent: safe to re-run, skips what is already correct, and
+# repairs what is not. All cluster-specific values live in etc/fn.env.
+set -uo pipefail
+FN_HOME=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+. "$FN_HOME/etc/fn.env"
+mkdir -p "$FN_LOGS"
+
+RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; DIM=$'\e[2m'; OFF=$'\e[0m'
+ok ()   { echo "  ${GRN}ok${OFF}   $*"; }
+bad ()  { echo "  ${RED}FAIL${OFF} $*"; FAILED=$((FAILED+1)); }
+warn () { echo "  ${YEL}warn${OFF} $*"; }
+say ()  { echo; echo "== $* =="; }
+
+# Run a command on the compute node. Uses the live serving job if there is one
+# (so we do not queue behind ourselves), else a short standalone allocation.
+on_node () {
+  if [ "$(hostname)" = "$FN_NODE" ]; then bash -c "$*"; return $?; fi
+  # Any of our jobs already on the node will do — overlap into it rather than
+  # queueing behind ourselves (a --mem=0 job holds the whole node).
+  local J; J=$(squeue -h -u "$USER" -t R -w "$FN_NODE" -o "%i" 2>/dev/null | head -1)
+  if [ -n "$J" ]; then
+    srun --jobid="$J" --overlap -n1 --mem=4G --cpus-per-task=2 -t 30 bash -c "$*"
+  else
+    srun -p "$FN_PARTITION" -w "$FN_NODE" -n1 --mem=8G --cpus-per-task=4 -t 30 bash -c "$*"
+  fi
+}
+on_node_gpu () {   # needs nvcc + a GPU (kernel build)
+  srun -p "$FN_PARTITION" -w "$FN_NODE" -n1 --mem=16G --cpus-per-task=8 --gres=gpu:1 -t 30 bash -c "$*"
+}
+# /scratch is node-local: the snapshot path can only be resolved on FN_NODE.
+snap_base () { on_node "ls -d '$FN_HF/hub/models--${FN_MODEL//\//--}'/snapshots/*/ 2>/dev/null | grep -v -- '-fp8hybrid' | head -1 | sed 's#/\$##'" 2>/dev/null | tail -1; }
+
+# ---------------------------------------------------------------- build stages
+stage_repo () {   # patch sources, on shared home so both nodes see them
+  local D=$FN_HOME/flash-dgx
+  if [ -d "$D/.git" ]; then
+    git -C "$D" fetch -q --depth 50 origin 2>/dev/null
+    git -C "$D" checkout -q "$FN_PATCH_REF" 2>/dev/null || git -C "$D" checkout -q main
+  else
+    git clone -q "$FN_PATCH_REPO" "$D" && git -C "$D" checkout -q "$FN_PATCH_REF" 2>/dev/null
+  fi
+  ok "patch sources at $(git -C "$D" rev-parse --short HEAD)"
+}
+
+stage_image () {
+  on_node "
+    set -e
+    [ -f '$FN_SP/vllm/models/$FN_MODEL_PKG/nvidia/ple_layer.py' ] && { echo '  image already extracted'; exit 0; }
+    mkdir -p '$FN_IMG' '$FN_SCRATCH/blobs'
+    tok () { curl -s \"https://auth.docker.io/token?service=registry.docker.io&scope=repository:$FN_IMAGE_REPO:pull\" \
+             | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"token\"])'; }
+    AC='application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+    curl -s -H \"Authorization: Bearer \$(tok)\" -H \"Accept: \$AC\" \
+      'https://registry-1.docker.io/v2/$FN_IMAGE_REPO/manifests/$FN_IMAGE_ARM64' > '$FN_SCRATCH/manifest.json'
+    python3 -c \"
+import json;d=json.load(open('$FN_SCRATCH/manifest.json'))
+open('$FN_SCRATCH/layers.txt','w').write('\n'.join(l['digest'] for l in d['layers']))\"
+    n=0
+    while read -r D; do
+      n=\$((n+1)); F='$FN_SCRATCH/blobs/'\${D#sha256:}
+      [ -s \"\$F\" ] || curl -sL -H \"Authorization: Bearer \$(tok)\" -o \"\$F\" \
+          \"https://registry-1.docker.io/v2/$FN_IMAGE_REPO/blobs/\$D\"
+      tar -xa --no-same-owner --no-same-permissions --overwrite -f \"\$F\" -C '$FN_IMG' 2>/dev/null || true
+    done < '$FN_SCRATCH/layers.txt'
+    echo \"  extracted \$n layers\"
+  "
+}
+
+stage_patches () {
+  on_node "FN_HOME='$FN_HOME' SP='$FN_SP' REPO='$FN_HOME/flash-dgx' MODPKG='$FN_MODEL_PKG' \
+           KDET='$FN_KDET_URL' KDETDIR='$FN_KDET' bash '$FN_HOME/bin/apply-patches.sh'"
+}
+
+stage_kernel () {
+  on_node "[ -f '$FN_KDET/_C_det.so' ]" >/dev/null 2>&1 && { ok "det-topk kernel already built"; return 0; }
+  on_node_gpu "FN_HOME='$FN_HOME' SP='$FN_SP' REPO='$FN_HOME/flash-dgx' MODPKG='$FN_MODEL_PKG' \
+               KDET='$FN_KDET_URL' KDETDIR='$FN_KDET' DET_ARCH='$FN_DET_ARCH' \
+               BUILD_KERNEL=1 bash '$FN_HOME/bin/apply-patches.sh'"
+}
+
+stage_weights () {
+  local S; S=$(snap_base)
+  if [ -n "$S" ]; then ok "checkpoint present ($(basename "$S"))"; return 0; fi
+  echo "  downloading $FN_MODEL (~126 GiB) as a job; follow $FN_LOGS/"
+  # The hf CLI: whatever is on PATH, else the huggingface_hub that ships inside the
+  # extracted image tree (stage 2 runs before this one), driven by the host python.
+  local HF='hf'
+  command -v hf >/dev/null 2>&1 || \
+    HF="PYTHONPATH='$FN_SP' PYTHONNOUSERSITE=1 python3.12 -c 'from huggingface_hub.cli.hf import main; main()'"
+  sbatch --parsable -p "$FN_PARTITION" -w "$FN_NODE" --mem=48G --cpus-per-task=16 -t 12:00:00 \
+    -J fn-download -o "$FN_LOGS/download-%j.out" --wrap \
+    "export HF_HOME=$FN_HF HF_HUB_DISABLE_XET=1 HF_TOKEN=\$(cat \$HOME/.cache/huggingface/token 2>/dev/null); \
+     $HF download $FN_MODEL --max-workers 8"
+}
+
+stage_hybrid () {
+  [ "$FN_MODE" = hybrid ] || { ok "mode=$FN_MODE, no conversion needed"; return 0; }
+  local S; S=$(snap_base); [ -n "$S" ] || { warn "no checkpoint yet; run build again after the download"; return 1; }
+  on_node "
+    S='$S'; D=\"\${S}-fp8hybrid\"
+    [ -f \"\$D/.prepared\" ] && { echo '  hybrid checkpoint already prepared'; exit 0; }
+    set -e
+    rm -rf \"\$D\"; cp -a \"\$S\" \"\$D\"
+    cp --remove-destination \"\$(readlink -f \"\$D/model.safetensors.index.json\")\" \"\$D/model.safetensors.index.json\"
+    PYTHONPATH='$FN_SP' PYTHONNOUSERSITE=1 python3.12 '$FN_HOME/flash-dgx/tools/fp8_convert.py' \"\$D\" \
+      | tee \"\$D/fp8_convert.log\" | tail -3
+    chmod 644 \"\$D\"/*.safetensors \"\$D\"/model.safetensors.index.json
+    touch \"\$D/.prepared\"
+  "
+}
+
+cmd_build () {
+  [ "${1:-}" = "--force" ] && { echo "forcing: clearing patch markers"; on_node "rm -rf '$FN_SP/.fn-patches'"; }
+  # Later stages are still worth attempting after an early failure (the weights
+  # download in particular is long and independent), so collect failures rather
+  # than bailing -- but never report success when one of them failed.
+  local failed=()
+  run_stage () { local label=$1; say "$label"; shift; "$@" || failed+=("$label"); }
+  run_stage "1/6 patch sources"        stage_repo
+  run_stage "2/6 official image"       stage_image
+  run_stage "3/6 patch stack"          stage_patches
+  run_stage "4/6 deterministic kernel" stage_kernel
+  run_stage "5/6 checkpoint"           stage_weights
+  run_stage "6/6 hybrid conversion"    stage_hybrid
+  echo
+  if [ ${#failed[@]} -gt 0 ]; then
+    echo "build INCOMPLETE: ${#failed[@]} stage(s) failed: ${failed[*]}"
+    echo "re-run 'fn build' once the cause is fixed; completed stages are skipped."
+    return 1
+  fi
+  echo "build done. next: fn verify"
+}
+
+# ------------------------------------------------------------------- verify
+cmd_verify () {
+  FAILED=0
+  say "verify (content checks, not stamps)"
+  on_node "SP='$FN_SP' MODPKG='$FN_MODEL_PKG' KDETDIR='$FN_KDET' FN_HF='$FN_HF' \
+           FN_MODEL='$FN_MODEL' MODE='$FN_MODE' bash '$FN_HOME/bin/verify.sh'"
+  FAILED=$?
+  echo
+  [ "$FAILED" = 0 ] && echo "${GRN}all checks passed${OFF}" || echo "${RED}$FAILED check(s) failed — run: fn build${OFF}"
+  return $FAILED
+}
+
+cmd_clean () {
+  [ "${1:-}" = "--yes" ] || { echo "this removes $FN_SCRATCH (build artifacts; weights in $FN_HF are kept)"; \
+                              echo "re-run: fn clean --yes"; return 1; }
+  on_node "rm -rf '$FN_IMG' '$FN_KDET' '$FN_SCRATCH/blobs'"
+  echo "cleaned. rebuild with: fn build"
+}
+
+case "${1:-}" in
+  build)  shift; cmd_build "$@" ;;
+  verify) cmd_verify ;;
+  clean)  shift; cmd_clean "$@" ;;
+  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac

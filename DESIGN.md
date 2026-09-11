@@ -512,6 +512,7 @@ serving/
 ├── bin/mirror_venv.sh           # optional: copy venv to local NVMe for faster cold start
 ├── bin/patch_vllm_gdn_sm120.sh  # re-apply after vLLM upgrades (see kernel section)
 ├── examples/                    # what to hand users: ALCF-style module, API demos, opencode config
+├── tools/flash-next/            # build + verify the Flash-Next runtime (its README)
 ├── ansible/                     # rebuild the stack on a fresh operator account (see its README)
 ├── etc/models/                  # one .env per servable model; `serving start <name>`
 ├── etc/keys.env                 # per-user API keys (600)

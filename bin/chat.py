@@ -26,7 +26,25 @@ import sys
 import urllib.error
 import urllib.request
 
-MODEL = "qwen3.8-27b"
+MODEL = "qwen3.8-27b"   # fallback only; main() asks the server what it is serving
+
+
+def _served_model(base):
+    """The endpoint serves whichever profile was selected (see etc/models/), so ask it
+    rather than hardcode a name. CHAT_MODEL overrides. A server that is down falls
+    back to the default; the request itself then fails with the usual message."""
+    if os.environ.get("CHAT_MODEL"):
+        return os.environ["CHAT_MODEL"]
+    try:
+        req = urllib.request.Request(f"{base}/models",
+                                     headers={"Authorization": "Bearer sk-local"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            ids = [m["id"] for m in json.load(r).get("data", [])]
+        if ids:
+            return ids[0]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return MODEL
 
 
 class EndpointError(Exception):
@@ -126,6 +144,7 @@ def ask(messages, args, base):
 
 
 def main():
+    global MODEL
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("prompt", nargs="*")
     p.add_argument("--port", type=int, default=8000)
@@ -145,6 +164,7 @@ def main():
         args.think = True
 
     base = f"http://127.0.0.1:{args.port}/v1"
+    MODEL = _served_model(base)
     messages = [{"role": "system", "content": args.system}] if args.system else []
 
     # Anything piped in becomes context for the prompt.
@@ -167,7 +187,7 @@ def main():
         messages.append({"role": "user", "content": content})
         sys.exit(0 if ask(messages, args, base) is not None else 1)
 
-    print(f"qwen3.8-27b via {base}   (Ctrl-D or 'exit' to quit, 'reset' to clear history)")
+    print(f"{MODEL} via {base}   (Ctrl-D or 'exit' to quit, 'reset' to clear history)")
     print(f"thinking: {'on, effort=' + args.effort if args.think else 'off'}\n")
     while True:
         try:
