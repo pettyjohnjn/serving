@@ -260,7 +260,7 @@ if [ "${DRY_RUN:-0}" != 1 ] && [ "$(hostname -s)" != "$PUBLISH_HOST" ]; then
 fi
 
 echo "=================================================================="
-echo " Qwen3.8-27B endpoint"
+echo " $SERVED_NAME endpoint  (profile: $MODEL_PROFILE)"
 echo " job=$SLURM_JOB_ID  host=$(hostname)  ip=$NODE_IP  port=$PORT"
 echo " model=$MODEL"
 echo " max_len=$MAX_MODEL_LEN  max_seqs=$MAX_SEQS  kv_bytes=$KV_CACHE_BYTES util=$GPU_UTIL"
