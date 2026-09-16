@@ -78,14 +78,16 @@ open('$FN_SCRATCH/layers.txt','w').write('\n'.join(l['digest'] for l in d['layer
 
 stage_patches () {
   on_node "FN_HOME='$FN_HOME' SP='$FN_SP' REPO='$FN_HOME/flash-dgx' MODPKG='$FN_MODEL_PKG' \
-           KDET='$FN_KDET_URL' KDETDIR='$FN_KDET' bash '$FN_HOME/bin/apply-patches.sh'"
+           KDET='$FN_KDET_URL' KDETDIR='$FN_KDET' SKIP='${FN_SKIP_PATCHES:-}' bash '$FN_HOME/bin/apply-patches.sh'"
 }
 
 stage_kernel () {
-  on_node "[ -f '$FN_KDET/_C_det.so' ]" >/dev/null 2>&1 && { ok "det-topk kernel already built"; return 0; }
+  # Done means BOTH the binary and the wiring (patch 8 marker): an earlier run can build the
+  # .so and then fail the anchor, and must not be mistaken for finished.
+  on_node "[ -f '$FN_KDET/_C_det.so' ] && [ -f '$FN_SP/.fn-patches/8' ]" >/dev/null 2>&1 && { ok "det-topk kernel built and wired"; return 0; }
   on_node_gpu "FN_HOME='$FN_HOME' SP='$FN_SP' REPO='$FN_HOME/flash-dgx' MODPKG='$FN_MODEL_PKG' \
                KDET='$FN_KDET_URL' KDETDIR='$FN_KDET' DET_ARCH='$FN_DET_ARCH' \
-               BUILD_KERNEL=1 bash '$FN_HOME/bin/apply-patches.sh'"
+               BUILD_KERNEL=1 SKIP='${FN_SKIP_PATCHES:-}' bash '$FN_HOME/bin/apply-patches.sh'"
 }
 
 stage_weights () {
