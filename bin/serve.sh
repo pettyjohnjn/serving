@@ -159,7 +159,7 @@ fi
 
 SPEC_ARGS=()
 if [ "${SPEC_TOKENS:-0}" -gt 0 ] 2>/dev/null; then
-    SPEC_ARGS=(--speculative-config "{\"method\":\"${SPEC_METHOD:-qwen3_5_mtp}\",\"num_speculative_tokens\":$SPEC_TOKENS}")
+    SPEC_ARGS=(--speculative-config "{\"method\":\"${SPEC_METHOD:-qwen3_5_mtp}\",\"num_speculative_tokens\":$SPEC_TOKENS${SPEC_EXTRA:-}}")
 fi
 if [ "$REQUIRE_API_KEY" = "1" ]; then
     # Via a --config file, never argv: /proc/<pid>/cmdline is world readable and this

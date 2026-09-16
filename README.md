@@ -124,3 +124,9 @@ Flash-Next needs its runtime built and verified first:
 
 The profile refuses to start if the weights or the prepared hybrid checkpoint are
 missing, rather than falling through to the 27B default.
+
+The Flash-Next profile serves two vLLM trees, selected by `FN_MODEL_PKG` (default
+`qwen4_exp`, the pinned nightly with the PLE overlay; `qwen3_8_flash_next` for the
+2026-08-26 image). Build either with `tools/flash-next/bin/fn build`; the profile picks the
+matching PLE environment, split ops, KV settings and speculative-config extras. See
+`tools/flash-next/README.md`.

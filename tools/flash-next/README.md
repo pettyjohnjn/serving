@@ -42,8 +42,10 @@ re-applies the stack from scratch.
 
     etc/fn.env            all tunables + pinned versions
     bin/fn                driver (build / verify / clean)
-    bin/apply-patches.sh  the 8 patches, marker-guarded, anchors asserted
-    bin/verify.sh         content checks, run on the node
+    bin/apply-overlay.sh  overlay/ diffs onto the nightly tree (stage 3, qwen4_exp only)
+    bin/apply-patches.sh  the 8 patches, marker-guarded, anchors asserted (1/4/5/7 skipped on qwen4_exp)
+    bin/verify.sh         content checks, run on the node; honours the skip list
+    overlay/              PLE mmap overlay as diffs against the pinned nightly + provenance (overlay/README.md)
     flash-dgx/            clone of the patch sources (created by build; git-ignored)
     logs/                 download job output (git-ignored)
 
@@ -64,3 +66,21 @@ re-applies the stack from scratch.
 - **Page-cache starvation.** A job cgroup is charged for file pages it reads, so a
   126 GiB weight read can push a memory-capped job to the OOM killer before the model
   is even loaded. The profile submits with `--mem=0` (whole node) for this reason.
+
+## Two trees, one profile
+
+`FN_MODEL_PKG` names the vLLM model package and thereby the tree: `qwen4_exp` is the pinned
+nightly `8a728663` plus `overlay/` (current; +22-29% decode over the August image, prefix
+caching restored with `SPEC_EXTRA`, fp8 KV), `qwen3_8_flash_next` is the 2026-08-26 image
+with the blazux PLE patch (the previous production tree, still buildable by setting the
+package and the old digest in `etc/fn.env`). The profile `etc/models/qwen38-flash-next.env`
+keys its PLE environment, split ops, KV dtype, KV pin and speculative-config extras on it.
+
+## Credits
+
+- blazux/qwen3.8-Flash-DGX (Apache-2.0): the original patch stack (`flash-dgx/`).
+- jschmied/qwen38-flash-next-gb10: the deterministic top-k kernel.
+- tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark (Kai / 2Wild, Apache-2.0): the PLE mmap
+  overlay and the MTP-head loading fixes in `overlay/`.
+- peakcrosser7 (vLLM PR #55375) and andreasgru (vLLM PR #54846): upstream fixes carried in
+  `overlay/` until a pinned nightly contains them.
