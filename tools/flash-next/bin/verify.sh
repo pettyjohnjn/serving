@@ -21,7 +21,8 @@ chk "6 fp8-hybrid hook in modelopt"    "grep -q '_fp8_hybrid_apply' '$SP/vllm/mo
 chk "6 fp8-hybrid dispatch in qsa"     "grep -q '_fp8_hybrid_excluded(quant_config)' '$M/qsa.py'"
 chk "7 qsa fp8 KV path"                "grep -qi 'fp8' '$M/ops/qsa.py'"
 chk "8 det-topk kernel built"          "[ -s '$KDETDIR/_C_det.so' ]"
-chk "8 det-topk wired into qsa"        "grep -qi 'det' '$M/ops/qsa.py'"
+QSA_DET=$M/ops/qsa.py; [ -f "$M/ops/qsa_indexer.py" ] && grep -q "torch.ops._C.persistent_topk" "$M/ops/qsa_indexer.py" && QSA_DET=$M/ops/qsa_indexer.py
+chk "8 det-topk wired into qsa"        "grep -q 'QSADET' '$QSA_DET'"
 chk "every module still parses"        "PYTHONPATH='$SP' PYTHONNOUSERSITE=1 python3.12 -c \"
 import ast,sys
 for f in ['$M/ple_layer.py','$M/qsa.py','$M/ops/qsa.py','$SP/vllm/v1/worker/mamba_utils.py',

@@ -359,6 +359,10 @@ VLLM_ARGV=(
     ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"}
     --enable-auto-tool-choice
     --enable-force-include-usage
+    # usage.prompt_tokens_details.cached_tokens on every response: the only per-request
+    # view of whether the prefix cache served a prompt or it was re-prefilled. Off by
+    # default in vLLM; both runtimes support it.
+    --enable-prompt-tokens-details
     ${REASON_ARGS[@]+"${REASON_ARGS[@]}"}
     ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}
     --shutdown-timeout "$DRAIN_SECONDS"
