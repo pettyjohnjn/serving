@@ -13,6 +13,9 @@
 set -uo pipefail
 FN_HOME=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 . "$FN_HOME/etc/fn.env"
+# The nightly tree (qwen4_exp) carries its own fixes for 1 and 4, has no anchor for 5, and PR #54846
+# (in the overlay) covers 7: skip those unless the caller set FN_SKIP_PATCHES explicitly.
+if [ "$FN_MODEL_PKG" = qwen4_exp ] && [ -z "${FN_SKIP_PATCHES+x}" ]; then FN_SKIP_PATCHES="1 4 5 7"; fi
 mkdir -p "$FN_LOGS"
 
 RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; DIM=$'\e[2m'; OFF=$'\e[0m'
@@ -76,6 +79,12 @@ open('$FN_SCRATCH/layers.txt','w').write('\n'.join(l['digest'] for l in d['layer
   "
 }
 
+stage_overlay () {
+  [ "$FN_MODEL_PKG" = qwen4_exp ] || { ok "no overlay for $FN_MODEL_PKG"; return 0; }
+  on_node "[ -f '$FN_SP/.fn-patches/overlay' ]" >/dev/null 2>&1 && { ok "overlay applied (marker present; fn build --force re-applies)"; return 0; }
+  on_node "SP='$FN_SP' FN_HOME='$FN_HOME' MODPKG='$FN_MODEL_PKG' bash '$FN_HOME/bin/apply-overlay.sh'"
+}
+
 stage_patches () {
   on_node "FN_HOME='$FN_HOME' SP='$FN_SP' REPO='$FN_HOME/flash-dgx' MODPKG='$FN_MODEL_PKG' \
            KDET='$FN_KDET_URL' KDETDIR='$FN_KDET' SKIP='${FN_SKIP_PATCHES:-}' bash '$FN_HOME/bin/apply-patches.sh'"
@@ -128,12 +137,13 @@ cmd_build () {
   # than bailing -- but never report success when one of them failed.
   local failed=()
   run_stage () { local label=$1; say "$label"; shift; "$@" || failed+=("$label"); }
-  run_stage "1/6 patch sources"        stage_repo
-  run_stage "2/6 official image"       stage_image
-  run_stage "3/6 patch stack"          stage_patches
-  run_stage "4/6 deterministic kernel" stage_kernel
-  run_stage "5/6 checkpoint"           stage_weights
-  run_stage "6/6 hybrid conversion"    stage_hybrid
+  run_stage "1/7 patch sources"        stage_repo
+  run_stage "2/7 official image"       stage_image
+  run_stage "3/7 PLE overlay"          stage_overlay
+  run_stage "4/7 patch stack"          stage_patches
+  run_stage "5/7 deterministic kernel" stage_kernel
+  run_stage "6/7 checkpoint"           stage_weights
+  run_stage "7/7 hybrid conversion"    stage_hybrid
   echo
   if [ ${#failed[@]} -gt 0 ]; then
     echo "build INCOMPLETE: ${#failed[@]} stage(s) failed: ${failed[*]}"
@@ -148,7 +158,7 @@ cmd_verify () {
   FAILED=0
   say "verify (content checks, not stamps)"
   on_node "SP='$FN_SP' MODPKG='$FN_MODEL_PKG' KDETDIR='$FN_KDET' FN_HF='$FN_HF' \
-           FN_MODEL='$FN_MODEL' MODE='$FN_MODE' bash '$FN_HOME/bin/verify.sh'"
+           FN_MODEL='$FN_MODEL' MODE='$FN_MODE' SKIP='${FN_SKIP_PATCHES:-}' bash '$FN_HOME/bin/verify.sh'"
   FAILED=$?
   echo
   [ "$FAILED" = 0 ] && echo "${GRN}all checks passed${OFF}" || echo "${RED}$FAILED check(s) failed — run: fn build${OFF}"
