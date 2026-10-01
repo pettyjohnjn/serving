@@ -29,10 +29,11 @@ say ()  { echo; echo "== $* =="; }
 on_node () {
   if [ "$(hostname)" = "$FN_NODE" ]; then bash -c "$*"; return $?; fi
   # Any of our jobs already on the node will do — overlap into it rather than
-  # queueing behind ourselves (a --mem=0 job holds the whole node).
+  # queueing behind ourselves (a --mem=0 job holds the whole node). -w matters: a multi-node
+  # job (TP2 serve, NCCL test) also matches, and without it the step lands on its FIRST node.
   local J; J=$(squeue -h -u "$USER" -t R -w "$FN_NODE" -o "%i" 2>/dev/null | head -1)
   if [ -n "$J" ]; then
-    srun --jobid="$J" --overlap -n1 --mem=4G --cpus-per-task=2 -t 30 bash -c "$*"
+    srun --jobid="$J" --overlap -w "$FN_NODE" -n1 --mem=4G --cpus-per-task=2 -t 30 bash -c "$*"
   else
     srun -p "$FN_PARTITION" -w "$FN_NODE" -n1 --mem=8G --cpus-per-task=4 -t 30 bash -c "$*"
   fi
