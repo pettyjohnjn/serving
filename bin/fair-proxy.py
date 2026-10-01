@@ -29,6 +29,12 @@ GET /fair-stats (from any user) returns the live per-user picture as JSON.
 
 Env: FAIR_LISTEN (8000), FAIR_UPSTREAM (8005), FAIR_TOTAL (32),
      FAIR_PER_USER (optional hard per-user ceiling on top; unset = none).
+
+Keyed listener (optional): FAIR_KEYED_LISTEN=host:port plus FAIR_KEYS_FILE (JSON {"<api key>": "<user>"}).
+Connections there come from other machines (agent jobs on the compute nodes), where the loopback uid trick
+cannot work, so each request is attributed by its "Authorization: Bearer <key>" header instead; a request
+without a known key gets 401 and is never forwarded. Both listeners share one slot pool. The keys file is
+re-read when it changes.
 Run by `serving supervise`; logs are one line per state change, never content.
 """
 import asyncio
@@ -44,6 +50,8 @@ LISTEN = ("127.0.0.1", int(os.environ.get("FAIR_LISTEN", "8000")))
 UPSTREAM = ("127.0.0.1", int(os.environ.get("FAIR_UPSTREAM", "8005")))
 TOTAL = int(os.environ.get("FAIR_TOTAL", "32"))
 PER_USER = int(os.environ.get("FAIR_PER_USER", "0"))    # 0 = no per-user ceiling
+KEYED = os.environ.get("FAIR_KEYED_LISTEN", "")
+KEYS_FILE = os.environ.get("FAIR_KEYS_FILE", "")
 USAGE_HALFLIFE = 600.0
 MAX_HEADER = 256 * 1024
 
@@ -140,6 +148,26 @@ def user_of_peer(port):
         return f"uid{uid}"
 
 
+_keys, _keys_mtime = {}, None
+
+
+def user_of_key(headers):
+    global _keys, _keys_mtime
+    try:
+        m = os.stat(KEYS_FILE).st_mtime
+        if m != _keys_mtime:
+            _keys, _keys_mtime = json.load(open(KEYS_FILE)), m
+    except (OSError, ValueError) as e:
+        log(f"keys file unreadable: {e}")
+    auth = headers.get("authorization", "")
+    key = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    return _keys.get(key) if key else None
+
+
+UNAUTHORIZED = (b"HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nConnection: close\r\n"
+                b"Content-Length: 37\r\n\r\nmissing or unknown API key (Bearer)\r\n")
+
+
 async def read_head(reader):
     raw = await reader.readuntil(b"\r\n\r\n")
     headers = {}
@@ -179,10 +207,10 @@ def stats_response(snapshot):
             + b"\r\nConnection: close\r\n\r\n" + body)
 
 
-async def handle(client_r, client_w):
+async def handle(client_r, client_w, keyed=False):
     peer = client_w.get_extra_info("peername")
-    user = user_of_peer(peer[1]) if peer else None
-    if user is None:
+    user = None if keyed else (user_of_peer(peer[1]) if peer else None)
+    if user is None and not keyed:
         client_w.close()
         return
     up_r = up_w = None
@@ -194,6 +222,12 @@ async def handle(client_r, client_w):
                 return
             first_line = req_raw.split(b"\r\n", 1)[0]
             method = first_line.split(b" ", 1)[0]
+            if keyed:
+                user = user_of_key(req_h)
+                if user is None:
+                    client_w.write(UNAUTHORIZED)
+                    await client_w.drain()
+                    return
 
             if method == b"GET" and first_line.split(b" ")[1].split(b"?")[0] == b"/fair-stats":
                 client_w.write(stats_response(SCHED.snapshot()))
@@ -261,8 +295,13 @@ async def main():
     log(f"fair-proxy: {LISTEN[0]}:{LISTEN[1]} -> {UPSTREAM[0]}:{UPSTREAM[1]}, "
         f"pool {TOTAL}, max-min fair under contention"
         + (f", per-user ceiling {PER_USER}" if PER_USER else ""))
-    async with server:
-        await server.serve_forever()
+    servers = [server]
+    if KEYED:
+        host, port = KEYED.rsplit(":", 1)
+        servers.append(await asyncio.start_server(lambda r, w: handle(r, w, keyed=True), host, int(port),
+                                                  limit=MAX_HEADER))
+        log(f"fair-proxy: keyed listener {KEYED} (users by API key from {KEYS_FILE})")
+    await asyncio.gather(*(s.serve_forever() for s in servers))
 
 
 if __name__ == "__main__":
