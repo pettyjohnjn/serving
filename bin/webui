@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# webui — Open WebUI, the browser chat frontend for the Qwen3.8-27B endpoint.
+# webui — Open WebUI, the browser chat frontend, and the identity proxy that also fronts the agent dashboard.
 #
 #   webui start | stop | restart | status | logs [-f] | ensure
 #
@@ -19,7 +19,8 @@
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
-VENV=$ROOT/venv-webui
+[ -f "$ROOT/etc/site.env" ] && . "$ROOT/etc/site.env"
+VENV=${WEBUI_VENV:-$ROOT/venv-webui}          # x86 env built by bin/install-webui-env.sh
 DATA=$ROOT/webui-data          # accounts, chat history (sqlite) — git-ignored, 0700
 LOG=$ROOT/logs/webui.log
 PLOG=$ROOT/logs/webui-idproxy.log
@@ -96,7 +97,9 @@ start_backend() {
     fi
     WEBUI_SECRET_KEY=$(cat "$DATA/.webui_secret_key")
     export WEBUI_SECRET_KEY
-    export WEBUI_NAME="Globus Cluster Inference"
+    export WEBUI_NAME="${WEBUI_NAME:-Cluster Inference}"
+    # Its own model cache (embedding model): a shared HF_HOME with HF_HUB_OFFLINE set elsewhere blocked it before.
+    export HF_HOME="$ROOT/state/hf"; unset HF_HUB_OFFLINE
     # Engine/access logs at INFO record every API path a user touches (chat ids,
     # activity timing). WARNING keeps real problems and drops the activity trail.
     export GLOBAL_LOG_LEVEL=WARNING
@@ -133,7 +136,8 @@ start_backend() {
 
 start_proxy() {
     alive "$PPIDFILE" && return 0
-    nohup python3 "$ROOT/bin/webui-idproxy.py" >> "$PLOG" 2>&1 &
+    mkdir -p "$ROOT/state/workbench" && chmod 700 "$ROOT/state/workbench"
+    WEBUI_NAME="${WEBUI_NAME:-Cluster Inference}" nohup python3 "$ROOT/bin/webui-idproxy.py" >> "$PLOG" 2>&1 &
     echo $! > "$PPIDFILE"
     echo "idproxy started (pid $!)"
 }

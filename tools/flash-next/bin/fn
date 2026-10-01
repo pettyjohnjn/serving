@@ -131,6 +131,25 @@ stage_hybrid () {
   "
 }
 
+stage_tp2 () {
+  # Tensor parallel 2 cannot use the hybrid checkpoint as is: the shared expert is 640 wide, 320 per rank, which is
+  # not a multiple of the 128x128 FP8 block. Same conversion with the shared expert left bf16 (0.24 GiB per rank).
+  [ "$FN_MODE" = hybrid ] || { ok "mode=$FN_MODE, no tp2 conversion needed"; return 0; }
+  local S; S=$(snap_base); [ -n "$S" ] || { warn "no checkpoint yet; run build again after the download"; return 1; }
+  on_node "
+    S='$S'; D=\"\${S}-fp8hybrid-tp2\"
+    [ -f \"\$D/.prepared\" ] && { echo '  tp2 checkpoint already prepared'; exit 0; }
+    set -e
+    rm -rf \"\$D\"; cp -a \"\$S\" \"\$D\"
+    cp --remove-destination \"\$(readlink -f \"\$D/model.safetensors.index.json\")\" \"\$D/model.safetensors.index.json\"
+    PYTHONPATH='$FN_SP' PYTHONNOUSERSITE=1 python3.12 '$FN_HOME/bin/fp8_convert_tp2.py' \"\$D\" \\
+      | tee \"\$D/fp8_convert.log\" | tail -3
+    grep -q '^done. worst per-tensor' \"\$D/fp8_convert.log\"
+    chmod 644 \"\$D\"/*.safetensors \"\$D\"/model.safetensors.index.json
+    touch \"\$D/.prepared\"
+  "
+}
+
 cmd_build () {
   [ "${1:-}" = "--force" ] && { echo "forcing: clearing patch markers"; on_node "rm -rf '$FN_SP/.fn-patches'"; }
   # Later stages are still worth attempting after an early failure (the weights
@@ -138,13 +157,14 @@ cmd_build () {
   # than bailing -- but never report success when one of them failed.
   local failed=()
   run_stage () { local label=$1; say "$label"; shift; "$@" || failed+=("$label"); }
-  run_stage "1/7 patch sources"        stage_repo
-  run_stage "2/7 official image"       stage_image
-  run_stage "3/7 PLE overlay"          stage_overlay
-  run_stage "4/7 patch stack"          stage_patches
-  run_stage "5/7 deterministic kernel" stage_kernel
-  run_stage "6/7 checkpoint"           stage_weights
-  run_stage "7/7 hybrid conversion"    stage_hybrid
+  run_stage "1/8 patch sources"        stage_repo
+  run_stage "2/8 official image"       stage_image
+  run_stage "3/8 PLE overlay"          stage_overlay
+  run_stage "4/8 patch stack"          stage_patches
+  run_stage "5/8 deterministic kernel" stage_kernel
+  run_stage "6/8 checkpoint"           stage_weights
+  run_stage "7/8 hybrid conversion"    stage_hybrid
+  run_stage "8/8 tp2 checkpoint"       stage_tp2
   echo
   if [ ${#failed[@]} -gt 0 ]; then
     echo "build INCOMPLETE: ${#failed[@]} stage(s) failed: ${failed[*]}"

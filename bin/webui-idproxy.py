@@ -8,13 +8,17 @@ socket in /proc/net/tcp IS the tunneling user — not guessable, not spoofable f
 laptop side. This proxy resolves it per connection and forwards every request to the
 Open WebUI backend with the trusted-auth headers it expects
 (WEBUI_AUTH_TRUSTED_EMAIL_HEADER / _NAME_HEADER). Accounts are auto-created on first
-visit as <unix-user>@globus.local; there is no signup or password.
+visit as <unix-user>@<IDPROXY_EMAIL_DOMAIN>; there is no signup or password.
 
 Incoming X-Globus-* headers are always stripped, so a browser cannot claim an identity.
 Requests and responses stream through unmodified otherwise; websocket upgrades switch
 the connection to a blind pipe after the handshake request.
 
-Run by bin/webui; not meant to be started by hand.
+A second route fronts the agent dashboard the same way: 127.0.0.1:8090 -> state/workbench/dashboard.sock with
+X-Workbench-User: <unix-user>. Both backends listen on unix sockets in 0700 directories, so this proxy is the only
+way any other account can reach them, and it is the only thing that can set the identity headers.
+
+Run by bin/serving; not meant to be started by hand.
 """
 import asyncio
 import json
@@ -29,6 +33,11 @@ LISTEN = ("127.0.0.1", 8080)
 # The backend listens on a unix socket inside the 0700 data dir — see bin/webui.
 ROOT = str(__import__("pathlib").Path(__file__).resolve().parent.parent)
 UPSTREAM_SOCKET = ROOT + "/webui-data/webui.sock"
+DASH_LISTEN = ("127.0.0.1", 8090)
+DASH_SOCKET = ROOT + "/state/workbench/dashboard.sock"
+USER_HEADER = "X-Workbench-User"
+SITE_NAME = os.environ.get("WEBUI_NAME", "Cluster Inference")
+EMAIL_DOMAIN = os.environ.get("IDPROXY_EMAIL_DOMAIN", "cluster.local")
 # Engine metrics come from the published port directly: probing through the
 # fairness gateway would bill every sampler fetch to the operator's usage ledger.
 VLLM_METRICS = "http://127.0.0.1:8005/metrics"
@@ -246,7 +255,7 @@ def stats_snapshot():
 
 
 STATS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
-<title>Globus Cluster Inference — status</title>
+<title>__SITE__ — status</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 :root{--bg:#F5F6F8;--card:#FFFFFF;--ink:#1A2028;--muted:#6A7484;--border:#E3E7ED;
@@ -303,7 +312,7 @@ canvas{width:100%;height:190px;display:block}
 footer{color:var(--muted);font-size:.78rem;margin-top:2rem;line-height:1.7}
 #tip{position:fixed;z-index:10;background:var(--ink);color:var(--bg);font-size:.75rem;padding:.3rem .55rem;border-radius:6px;pointer-events:none;display:none;white-space:nowrap}
 </style></head><body><main>
-<header><h1>Globus Cluster Inference</h1>
+<header><h1>__SITE__</h1>
 <span class="pill"><span class="dot" id="pdot"></span><span id="ptxt">connecting…</span></span></header>
 <div class="banner" id="banner"><div class="state" id="bstate">Connecting to the cluster…</div>
 <div class="bsub" id="bsub">this page auto-refreshes every 2 s</div></div>
@@ -313,7 +322,7 @@ footer{color:var(--muted);font-size:.78rem;margin-top:2rem;line-height:1.7}
 <div class="strip" id="strip"></div>
 <div class="axis"><span>90 days ago</span><span>today</span></div>
 <div class="comp">
-<div class="row">Inference engine<span class="sub">vLLM on globus3</span><span class="st"><span class="dot" id="c-eng"></span><span id="t-eng">–</span></span></div>
+<div class="row">Inference engine<span class="sub">vLLM, two nodes</span><span class="st"><span class="dot" id="c-eng"></span><span id="t-eng">–</span></span></div>
 <div class="row">Fairness gateway<span class="sub">API, port 8000</span><span class="st"><span class="dot" id="c-gw"></span><span id="t-gw">–</span></span></div>
 <div class="row">Web UI<span class="sub">chat, port 8080</span><span class="st"><span class="dot" id="c-web"></span><span id="t-web">–</span></span></div>
 </div></div>
@@ -387,7 +396,7 @@ async function tick(){
   g('kv').textContent=((s.kv_usage??0)*100).toFixed(1)+'%';
   if(s.fair&&s.fair.users!=null)g('users').textContent=s.fair.users;
   if(s.node){
-   const n=s.node,parts=['globus3'];
+   const n=s.node,parts=['engine head'];
    if(n.gpu_util!=null)parts.push('GPU '+n.gpu_util+'%');
    if(n.mem_used_gib!=null)parts.push('memory '+n.mem_used_gib.toFixed(0)+' / '+n.mem_total_gib.toFixed(0)+' GiB');
    if(n.load1!=null)parts.push('CPU '+Math.round(100*parseFloat(n.load1)/20)+'%');
@@ -519,7 +528,7 @@ def local_response(path):
         body = json.dumps(USAGE_VIEW).encode()
         ctype = b"application/json"
     elif path in ("/globus-stats", "/globus-stats/"):
-        body = STATS_PAGE.encode()
+        body = STATS_PAGE.replace("__SITE__", SITE_NAME).encode()
         ctype = b"text/html; charset=utf-8"
     else:
         return None
@@ -528,10 +537,10 @@ def local_response(path):
             b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n" + body)
 
 
-def uid_of_peer(port):
-    """uid owning the loopback socket (127.0.0.1:port -> LISTEN). Kernel truth."""
+def uid_of_peer(port, listen_port=LISTEN[1]):
+    """uid owning the loopback socket (127.0.0.1:port -> 127.0.0.1:listen_port). Kernel truth."""
     want_local = f"0100007F:{port:04X}"
-    want_rem = f"0100007F:{LISTEN[1]:04X}"
+    want_rem = f"0100007F:{listen_port:04X}"
     with open("/proc/net/tcp") as f:
         next(f)
         for line in f:
@@ -541,8 +550,8 @@ def uid_of_peer(port):
     return None
 
 
-def identity(port):
-    uid = uid_of_peer(port)
+def identity(port, listen_port=LISTEN[1]):
+    uid = uid_of_peer(port, listen_port)
     if uid is None:
         return None
     try:
@@ -597,7 +606,10 @@ async def copy_body(headers_lc, reader, writer):
     return True
 
 
-async def client_to_upstream(reader, writer, email, name, client_w):
+STRIP = {h.lower().encode() for h in ("X-Globus-Email", "X-Globus-Name", "X-Workbench-User", "X-Workbench-Name")}
+
+
+async def client_to_upstream(reader, writer, inject, client_w, local=True):
     """Parse each request head, strip identity headers, inject ours, stream the body."""
     while True:
         try:
@@ -611,7 +623,7 @@ async def client_to_upstream(reader, writer, email, name, client_w):
         # Paths the proxy answers itself (stats). Browsers do not pipeline, so any
         # earlier proxied response on this connection has already fully passed through.
         parts = request_line.split(b" ")
-        if len(parts) >= 2 and parts[0] == b"GET":
+        if local and len(parts) >= 2 and parts[0] == b"GET":
             path = parts[1].split(b"?", 1)[0].decode(errors="replace")
             resp = await asyncio.get_running_loop().run_in_executor(
                 None, local_response, path)
@@ -625,7 +637,7 @@ async def client_to_upstream(reader, writer, email, name, client_w):
             if not line:
                 continue
             key = line.split(b":", 1)[0].strip().lower()
-            if key in (EMAIL_HEADER.lower().encode(), NAME_HEADER.lower().encode()):
+            if key in STRIP:
                 continue                                    # no self-claimed identities
             if b":" in line:
                 k, v = line.split(b":", 1)
@@ -633,8 +645,7 @@ async def client_to_upstream(reader, writer, email, name, client_w):
             out.append(line)
         if headers_lc.get("upgrade", "").lower() == "websocket":
             upgrade = True
-        out.append(f"{EMAIL_HEADER}: {email}".encode())
-        out.append(f"{NAME_HEADER}: {name}".encode())
+        out.extend(f"{k}: {v}".encode() for k, v in inject)
         writer.write(b"\r\n".join(out) + b"\r\n\r\n")
         await writer.drain()
         if not await copy_body(headers_lc, reader, writer):
@@ -644,9 +655,11 @@ async def client_to_upstream(reader, writer, email, name, client_w):
             return
 
 
-async def handle(client_r, client_w):
+async def handle(client_r, client_w, route="webui"):
+    listen_port, sock, what = ((LISTEN[1], UPSTREAM_SOCKET, "web UI") if route == "webui"
+                               else (DASH_LISTEN[1], DASH_SOCKET, "agent dashboard"))
     peer = client_w.get_extra_info("peername")
-    ident = identity(peer[1]) if peer else None
+    ident = identity(peer[1], listen_port) if peer else None
     if ident is None:
         client_w.write(b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n"
                        b"Connection: close\r\n\r\n"
@@ -656,16 +669,18 @@ async def handle(client_r, client_w):
         return
     user, name = ident
     try:
-        up_r, up_w = await asyncio.open_unix_connection(UPSTREAM_SOCKET)
+        up_r, up_w = await asyncio.open_unix_connection(sock)
     except OSError:
         client_w.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\n"
                        b"Connection: close\r\n\r\n"
-                       b"The web UI backend is not running. Try: ssh globus1 serving/bin/webui status\r\n")
+                       + f"The {what} is not running (operator: bin/serving status).\r\n".encode())
         await client_w.drain()
         client_w.close()
         return
     await asyncio.gather(
-        client_to_upstream(client_r, up_w, f"{user}@globus.local", name, client_w),
+        client_to_upstream(client_r, up_w,
+                           [(EMAIL_HEADER, f"{user}@{EMAIL_DOMAIN}"), (NAME_HEADER, name)] if route == "webui"
+                           else [(USER_HEADER, user)], client_w, local=(route == "webui")),
         pipe(up_r, client_w),
         return_exceptions=True,
     )
@@ -678,11 +693,12 @@ async def handle(client_r, client_w):
 
 async def main():
     server = await asyncio.start_server(handle, *LISTEN, limit=MAX_HEADER)
+    dash = await asyncio.start_server(lambda r, w: handle(r, w, "dashboard"), *DASH_LISTEN, limit=MAX_HEADER)
     sampler = asyncio.create_task(usage_sampler())
-    print(f"idproxy: {LISTEN[0]}:{LISTEN[1]} -> {UPSTREAM_SOCKET}", flush=True)
+    print(f"idproxy: {LISTEN[0]}:{LISTEN[1]} -> {UPSTREAM_SOCKET}; {DASH_LISTEN[0]}:{DASH_LISTEN[1]} -> {DASH_SOCKET}",
+          flush=True)
     try:
-        async with server:
-            await server.serve_forever()
+        await asyncio.gather(server.serve_forever(), dash.serve_forever())
     finally:
         sampler.cancel()
 

@@ -1,120 +1,50 @@
 #!/usr/bin/env bash
-# serving — single entrypoint for the inference endpoint.
+# serving — single entrypoint for the inference endpoint and its login-node services. Run as the service account
+# on the login node.
 #
-#   serving start [model]    launch the slurm job (refuses if one is already up)
-#   serving stop             drain in-flight requests, then stop
-#   serving restart [model]  stop, wait for memory to be released, start
+#   serving start          submit the engine job (two nodes, tensor parallel); refuses if one is already up
+#   serving stop           drain in-flight requests, then stop; supervision pauses until the next start
+#   serving restart        stop, wait for memory to be released, start
+#   serving status         job state, reachability, live load, login-node services
+#   serving logs [-f|N]    show (or follow) the current engine job's log
+#   serving test           smoke-test the running endpoint
+#   serving keys           list | add <user> | show <user> | revoke <user>   (API keys for the keyed listener)
+#   serving doctor         diagnose a broken or unreachable endpoint
+#   serving supervise      cron: keep the login services up, resubmit the engine if it should run and does not
+#   serving install        one-time: authorize the tunnel key, install the cron line, start the services
+#   serving services start|stop|restart|status [fair-proxy|webui|dashboard|all]
 #
-# [model] selects a profile from etc/models/ and STICKS: the choice is remembered so
-# that `supervise`, which resubmits from a timer with no arguments, brings back the same
-# model. `status` shows which is active.
-#   serving restart qwen38-flash-next
-#   serving restart qwen38-27b            # rollback
-#
-# The selection sticks even if the launch then fails -- an operator who asked for a model
-# should not get the other one back silently. `supervise` will retry it and give up per
-# SUPER_MAX rather than quietly serving something else.
-#   serving status       job state, reachability, live load, MTP acceptance
-#   serving logs [-f]    show (or follow) the current job's log
-#   serving test         smoke-test the running endpoint
-#   serving keys         list / add / revoke user API keys
-#   serving doctor       diagnose a broken or unreachable endpoint
-#   serving supervise    restart if down (intended for cron; safe to run often)
-#
+# Login-node services (as this account): fair-proxy on 127.0.0.1:8000 (users by account) and
+# $LOGIN_CLUSTER_IP:$KEYED_PORT (users by API key; agent jobs); Open WebUI + the identity proxy (bin/webui) on
+# 127.0.0.1:8080 and the agent dashboard behind it on 127.0.0.1:8090. The engine publishes to 127.0.0.1:8005.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
-# Site-specific names (compute node, public login FQDN) live in etc/site.env,
-# which is git-ignored — copy etc/site.env.example and fill it in.
-[ -f "$ROOT/etc/site.env" ] && . "$ROOT/etc/site.env"
-# site.env is Ansible-managed; keep its value as the DECLARED default so an
-# operator override in logs/.model-profile wins until someone clears it.
-SITE_MODEL_PROFILE=${MODEL_PROFILE:-}
-unset MODEL_PROFILE
-COMPUTE_NODE=${COMPUTE_NODE:-globus3}
-LOGIN_FQDN=${LOGIN_FQDN:-}
+[ -f "$ROOT/etc/site.env" ] || { echo "serving: missing $ROOT/etc/site.env (copy etc/site.env.example)" >&2; exit 1; }
+. "$ROOT/etc/site.env"
 JOB=qwen38-serve
 PORT=8000
-# Which model this endpoint serves. Set MODEL_PROFILE in etc/site.env; it must reach
-# the job explicitly, because `supervise` resubmits from a systemd timer whose
-# environment has nothing in it.
-# Which model this endpoint serves, in precedence order:
-#   1. the argument to `serving start|restart <profile>`
-#   2. logs/.model-profile -- what a previous such command selected
-#   3. MODEL_PROFILE from etc/site.env (Ansible-managed, the declared default)
-#   4. qwen38-27b
-# (2) exists because `supervise` resubmits from a systemd timer with no arguments: if the
-# selection lived only in argv, the next supervised restart would silently bring back the
-# OTHER model. It is a deliberate operator override of (3), so `status` reports the drift.
-# It is NOT in etc/ because that directory is Ansible-managed and `make apply` would
-# revert it mid-incident.
-PROFILE_STATE=$ROOT/logs/.model-profile
-MODEL_PROFILE=${MODEL_PROFILE:-}
-if [ -z "$MODEL_PROFILE" ] && [ -s "$PROFILE_STATE" ]; then
-    MODEL_PROFILE=$(tr -d '[:space:]' < "$PROFILE_STATE")
-fi
-MODEL_PROFILE=${MODEL_PROFILE:-${SITE_MODEL_PROFILE:-qwen38-27b}}
-PROFILE_FILE=$ROOT/etc/models/$MODEL_PROFILE.env
-
-# Switch the selection. Validates first: naming a profile that does not exist must fail
-# here, not after the endpoint is already down.
-select_profile() {
-    local want=$1
-    [ -r "$ROOT/etc/models/$want.env" ] || {
-        echo "serving: no such model profile '$want'" >&2
-        echo "         available: $(cd "$ROOT/etc/models" 2>/dev/null && ls *.env 2>/dev/null | sed 's/\.env$//' | tr '\n' ' ')" >&2
-        exit 1
-    }
-    MODEL_PROFILE=$want
-    PROFILE_FILE=$ROOT/etc/models/$want.env
-    PROFILE_SBATCH=(); PROFILE_COLDSTART=720
-    eval "$(grep -E '^PROFILE_(SBATCH|COLDSTART)=' "$PROFILE_FILE")"
-    SBATCH_ARGS=(-w "$COMPUTE_NODE" -o "$ROOT/logs/serve-%j.out" -e "$ROOT/logs/serve-%j.out"
-                 ${PROFILE_SBATCH[@]+"${PROFILE_SBATCH[@]}"}
-                 --export=ALL,SERVING_ROOT="$ROOT",MODEL_PROFILE="$MODEL_PROFILE")
-    mkdir -p "$ROOT/logs"
-    printf '%s\n' "$want" > "$PROFILE_STATE"
-}
-# Scheduler knobs cannot come from #SBATCH (static) or from sourcing the profile
-# (it resolves weights and may refuse), so read exactly those two assignments.
-PROFILE_SBATCH=()
-PROFILE_COLDSTART=720
-if [ -r "$PROFILE_FILE" ]; then
-    eval "$(grep -E '^PROFILE_(SBATCH|COLDSTART)=' "$PROFILE_FILE")"
-fi
-# A missing profile must NOT disable diagnostics: status/doctor/logs/test are exactly
-# what an operator reaches for when a deploy went wrong. Only the commands that submit
-# a job insist on it.
-require_profile () {
-    [ -r "$PROFILE_FILE" ] && return 0
-    echo "serving: no such model profile: $PROFILE_FILE" >&2
-    echo "         set MODEL_PROFILE in etc/site.env, or deploy etc/models/" >&2
-    exit 1
-}
-
-SBATCH_ARGS=(-w "$COMPUTE_NODE" -o "$ROOT/logs/serve-%j.out" -e "$ROOT/logs/serve-%j.out"
-             ${PROFILE_SBATCH[@]+"${PROFILE_SBATCH[@]}"}
-             --export=ALL,SERVING_ROOT="$ROOT",MODEL_PROFILE="$MODEL_PROFILE")
-KEYS=$ROOT/etc/keys.env
+COLDSTART=1200                 # boot is ~10 min (weights + graph capture on both nodes); supervise waits this long
+SBATCH_ARGS=(-J "$JOB" -p "$ENGINE_PARTITION" -N2 -w "$ENGINE_NODES" -o "$ROOT/logs/serve-%j.out"
+             -e "$ROOT/logs/serve-%j.out" --export=ALL,SERVING_ROOT="$ROOT")
+SERVE=$ROOT/jobs/serve.sbatch
+KEYS=$ROOT/state/keys.json
 EP=$ROOT/etc/endpoint.json
-# The served model name comes from the running job (endpoint.json), not from the
-# selected profile: for the length of a cold start after a switch the two differ.
-served_model () {
-    sed -n 's/.*"model": *"\([^"]*\)".*/\1/p' "$EP" 2>/dev/null | head -1 | grep . || echo '(see /v1/models)'
-}
+SHARED_MIRROR=${SHARED_MIRROR:-/shared/llm}
+served_model () { sed -n 's/.*"model": *"\([^"]*\)".*/\1/p' "$EP" 2>/dev/null | head -1 | grep . || echo '(see /v1/models)'; }
 KEEP_LOGS=${KEEP_LOGS:-15}
-DRAIN_WAIT=${DRAIN_WAIT:-280}   # > serve.sh DRAIN_SECONDS(240) so a real drain can finish
+DRAIN_WAIT=${DRAIN_WAIT:-180}
 
 c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
 die()  { printf '%serror:%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
 info() { printf '%s\n' "$*"; }
 warn() { printf '%swarn:%s %s\n' "$c_yel" "$c_off" "$*"; }
+umask 077
+mkdir -p "$ROOT/logs" "$ROOT/state"
+[ -s "$KEYS" ] || echo '{}' > "$KEYS"
 
-# cron does NOT reliably export USER. With `set -u` that made every squeue helper fail in its
-# subshell, job_state() came back empty, and supervise concluded "no job" and submitted a
-# duplicate every 5 minutes. Never depend on $USER here.
+# cron does NOT reliably export USER; never depend on $USER here.
 ME=$(id -un)
-
 # Prefer a RUNNING job when several exist, so a queued duplicate can never mask the live one.
 job_line()  { squeue -h -u "$ME" -n "$JOB" -o '%T %i %N' 2>/dev/null | sort -r | head -1; }
 job_ids()   { squeue -h -u "$ME" -n "$JOB" -o '%i' 2>/dev/null; }
@@ -122,35 +52,21 @@ job_state() { job_line | awk '{print $1}'; }
 job_id()    { job_line | awk '{print $2}'; }
 job_node()  { job_line | awk '{print $3}'; }
 
-# One lock for ALL lifecycle operations, not just supervise: otherwise the cron can submit a
-# job while a human is mid-restart (observed: jobs 532 and 533 queued during one restart).
+# One lock for ALL lifecycle operations: otherwise cron can submit a job while a human is mid-restart.
 LOCK="$ROOT/logs/.serving.lock"
-take_lock() {  # $1 = "wait" | "nowait"
-    mkdir -p "$ROOT/logs" 2>/dev/null
-    # `|| return 0` used to report the lock as TAKEN when opening it failed -- e.g. when
-    # logs/ is not writable by the caller. Every lifecycle command then ran unserialised,
-    # and the SUPER_STATE writes failed silently too, so the SUPER_MAX give-up guard never
-    # fired. Fail closed instead: no lock, no action.
+take_lock() {  # $1 = "wait" | "nowait"; fails closed
     exec 9>"$LOCK" 2>/dev/null || { echo "cannot open $LOCK -- refusing to proceed" >&2; return 1; }
     if [ "${1:-wait}" = "nowait" ]; then flock -n 9 2>/dev/null || return 1
     else flock -w 600 9 2>/dev/null || return 1; fi
-    return 0
 }
-cur_log()   { local j; j=$(job_id); [ -n "$j" ] && echo "$ROOT/logs/serve-$j.out"; }
-first_key() { grep -m1 -E '^KEY_' "$KEYS" 2>/dev/null | cut -d= -f2-; }
-health()    { curl -s -m 8 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health" 2>/dev/null; }
+cur_log() { local j; j=$(job_id); [ -n "$j" ] && echo "$ROOT/logs/serve-$j.out"; }
+health()  { curl -s -m 8 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health" 2>/dev/null; }
 
 rotate_logs() {
-    local n
-    n=$(ls -1t "$ROOT"/logs/serve-*.out 2>/dev/null | wc -l)
-    [ "$n" -le "$KEEP_LOGS" ] && return 0
     ls -1t "$ROOT"/logs/serve-*.out 2>/dev/null | tail -n +$((KEEP_LOGS + 1)) | while read -r f; do rm -f "$f"; done
-    info "${c_dim}rotated logs (kept newest $KEEP_LOGS)${c_off}"
 }
-
 wait_ready() {   # $1 = timeout seconds
-    local t=${1:-900} i=0 log
-    log=$(cur_log)
+    local t=${1:-1500} i=0 log; log=$(cur_log)
     printf 'waiting for the model to load '
     while [ "$i" -lt "$t" ]; do
         [ "$(health)" = "200" ] && { printf ' %sready%s\n' "$c_grn" "$c_off"; return 0; }
@@ -160,94 +76,99 @@ wait_ready() {   # $1 = timeout seconds
     printf ' %stimed out%s\n' "$c_red" "$c_off"; return 1
 }
 
-# A '#' comment inside the backslash-continued `vllm serve` command ends the logical line and
-# silently drops every flag after it. That once launched vLLM with no arguments at all --
-# losing --host, which exposed the port publicly. Nothing in bash -n catches it, so check here.
+# Prove the flags that make the endpoint safe reach vLLM: a truncated ARGS array once launched vLLM without
+# --host, which exposed the port publicly. bash -n cannot catch it.
 lint_serve_script() {
-    python3 - "$ROOT/bin/serve.sh" <<'PYEOF'
+    python3 - "$SERVE" <<'PYEOF'
 import re, sys
 lines = open(sys.argv[1]).read().split("\n")
-
-# The command used to be a backslash-continued literal anchored on
-# `"$SERVING_ROOT/venv2/bin/vllm" serve`. It is now an array, because the runtime
-# differs per model profile (the 27B's venv cannot load Flash-Next). The gate keeps
-# its purpose: prove the flags that make this endpoint safe actually reach vllm.
 try:
-    start = next(i for i, l in enumerate(lines) if l.startswith("VLLM_ARGV=("))
+    start = next(i for i, l in enumerate(lines) if l.strip().startswith("local ARGS=("))
 except StopIteration:
-    sys.exit("lint: could not find the VLLM_ARGV assembly in serve.sh")
-i, flags, depth = start, [], 0
-while i < len(lines):
-    l = lines[i]
-    depth += l.count("(") - l.count(")")
-    flags += re.findall(r"--[a-z0-9-]+", l)
-    if depth <= 0 and i > start:
+    sys.exit("lint: could not find the ARGS assembly in serve.sbatch")
+flags = set(); depth = 0
+for l in lines[start:]:
+    code = l.split("#", 1)[0] if l.strip().startswith("#") else l
+    depth += code.count("(") - code.count(")")
+    flags.update(re.findall(r"--[a-z0-9-]+", code))
+    if depth <= 0:
         break
-    i += 1
-else:
-    sys.exit("lint: VLLM_ARGV=( is never closed")
-
-# Flags that live in the profile rather than the shared array. Absent here on purpose;
-# serve.sh asserts the profile defines profile_args()/profile_env() before binding.
-for required in ("--host", "--served-model-name", "--port"):
+for required in ("--served-model-name", "--enable-prefix-caching", "--speculative-config"):
     if required not in flags:
         sys.exit(f"lint: {required} never reaches vllm (array truncated?)")
-
-# The array is useless if nothing executes it, and a stray edit that drops the
-# expansion would start NOTHING while every other check still passed.
-if not any(re.search(r'"\$\{VLLM_ARGV\[@\]\}"', l) for l in lines):
-    sys.exit("lint: VLLM_ARGV is assembled but never executed")
-
-# The profile decides the runtime, so a profile that sets no launcher would expand to
-# an empty command. serve.sh checks at run time; check the contract exists at all.
-if not any(l.strip().startswith("declare -p VLLM_LAUNCH") for l in lines):
-    sys.exit("lint: serve.sh no longer asserts the profile sets VLLM_LAUNCH")
+text = "\n".join(lines)
+if not re.search(r'ARGS\+=\(--host 127\.0\.0\.1 --port', text):
+    sys.exit("lint: the head node no longer binds 127.0.0.1")
+if not re.search(r'serve "\$\{ARGS\[@\]\}"', text):
+    sys.exit("lint: ARGS is assembled but never executed")
+if "0.0.0.0" in re.sub(r"#.*", "", text):
+    sys.exit("lint: 0.0.0.0 appears in serve.sbatch")
 PYEOF
 }
 
+# ---------------------------------------------------------------- login-node services
+pat () { case $1 in fair-proxy) echo "[f]air-proxy.py";; dashboard) echo "[w]orkbench/dashboard.py";; esac; }
+# capture first: with pipefail, grep -q exiting early makes the producer die of SIGPIPE and the test fail
+svc_running () { case $1 in webui) local o; o=$("$ROOT/bin/webui" status 2>/dev/null); grep -q "^backend  running" <<<"$o" ;;
+                 *) pgrep -u "$ME" -f "$(pat "$1")" >/dev/null ;; esac; }
+svc_start () {
+    case $1 in
+      fair-proxy)
+        svc_running fair-proxy && return 0
+        FAIR_LISTEN=$PORT FAIR_UPSTREAM=8005 FAIR_TOTAL=${FAIR_TOTAL:-32} FAIR_PER_USER=${FAIR_PER_USER:-0} \
+        FAIR_KEYED_LISTEN="$LOGIN_CLUSTER_IP:$KEYED_PORT" FAIR_KEYS_FILE="$KEYS" \
+          nohup python3 "$ROOT/bin/fair-proxy.py" >> "$ROOT/logs/fair-proxy.log" 2>&1 &
+        echo "[$(date -Is)] started fair-proxy" >> "$ROOT/logs/supervise.log" ;;
+      webui) "$ROOT/bin/webui" ensure ;;
+      dashboard)
+        svc_running dashboard && return 0
+        nohup "$WEBUI_VENV/bin/python" "$ROOT/workbench/dashboard.py" >> "$ROOT/logs/dashboard.log" 2>&1 &
+        echo "[$(date -Is)] started dashboard" >> "$ROOT/logs/supervise.log" ;;
+    esac
+}
+svc_stop () {
+    case $1 in webui) "$ROOT/bin/webui" stop ;;
+               *) pkill -u "$ME" -f "$(pat "$1")" && info "stopped $1" ;; esac
+}
+svc_list () { case ${1:-all} in all) echo fair-proxy webui dashboard ;; fair-proxy|webui|dashboard) echo "$1" ;;
+              *) die "unknown service '$1' (fair-proxy|webui|dashboard|all)" ;; esac; }
+cmd_services () {
+    local action=${1:-status} s; shift || true
+    case $action in
+      start)   for s in $(svc_list "${1:-all}"); do svc_start "$s"; done ;;
+      stop)    for s in $(svc_list "${1:-all}"); do svc_stop "$s"; done ;;
+      restart) for s in $(svc_list "${1:-all}"); do svc_stop "$s"; sleep 1; svc_start "$s"; done ;;
+      status)  for s in $(svc_list "${1:-all}"); do
+                 svc_running "$s" && printf '  %-11s %srunning%s\n' "$s" "$c_grn" "$c_off" \
+                                  || printf '  %-11s %sNOT RUNNING%s\n' "$s" "$c_red" "$c_off"; done ;;
+      *) die "usage: serving services start|stop|restart|status [fair-proxy|webui|dashboard|all]" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- engine lifecycle
 cmd_start() {
-    [ -n "${1:-}" ] && select_profile "$1"
     take_lock wait || die "another serving operation is in progress"
     rm -f "$ROOT/logs/.paused"
-    lint_serve_script || die "refusing to start: serve.sh would launch vllm with missing flags"
+    lint_serve_script || die "refusing to start: serve.sbatch would launch vllm without its safety flags"
     local st; st=$(job_state)
-    if [ -n "$st" ]; then
-        info "already $st as job $(job_id) on $(job_node); use 'serving restart' to replace it"
-        return 0
-    fi
-    # keys.env is only needed when REQUIRE_API_KEY=1; SSH-only mode needs no secret.
+    [ -n "$st" ] && { info "already $st as job $(job_id) on $(job_node); use 'serving restart' to replace it"; return 0; }
     rotate_logs
-    require_profile
-    local out; out=$(cd "$ROOT" && sbatch "${SBATCH_ARGS[@]}" bin/serve.sh 2>&1) || die "$out"
+    local out; out=$(cd "$ROOT" && sbatch "${SBATCH_ARGS[@]}" "$SERVE" 2>&1) || die "$out"
     info "$out"
-    # Derived from the profile, not fixed at 900: Flash-Next boots in 700-800 s, so a
-    # flat 900 leaves ~100 s of margin and a slow boot reports a false failure while
-    # the job is in fact fine. 27B keeps its effective 900 (720 + 180).
-    wait_ready $((PROFILE_COLDSTART + 180)) && cmd_status
+    wait_ready $((COLDSTART + 300)) && cmd_status
 }
 
 cmd_stop() {
     take_lock wait || die "another serving operation is in progress"
-    # 'stop' must mean stopped: without this the cron would resurrect it within 5 minutes.
-    touch "$ROOT/logs/.paused"
-    local ids; ids=$(job_ids)
+    touch "$ROOT/logs/.paused"          # 'stop' must mean stopped: otherwise cron resurrects it within 5 minutes
+    local ids j st; ids=$(job_ids)
     [ -z "$ids" ] && { info "not running (supervision paused; 'serving start' resumes it)"; return 0; }
-
-    # Cancel every matching job, not just one — duplicates can exist (a queued job behind a
-    # running one). PENDING jobs cannot drain, so they are cancelled outright rather than
-    # waiting out a 120s timeout for a signal nothing will handle.
-    local j st
     for j in $ids; do
         st=$(squeue -h -j "$j" -o '%T' 2>/dev/null)
-        if [ "$st" = "RUNNING" ]; then
-            info "draining job $j (in-flight requests get up to ${DRAIN_WAIT}s)..."
-            scancel --signal=TERM --batch "$j" 2>/dev/null
-        else
-            info "cancelling queued job $j"
-            scancel "$j" 2>/dev/null
-        fi
+        if [ "$st" = "RUNNING" ]; then info "draining job $j (in-flight requests get up to 120 s)..."
+             scancel --signal=TERM --batch "$j" 2>/dev/null
+        else info "cancelling queued job $j"; scancel "$j" 2>/dev/null; fi
     done
-
     local i=0
     while [ "$i" -lt "$DRAIN_WAIT" ]; do
         [ -z "$(job_ids)" ] && { info "stopped; supervision paused."; return 0; }
@@ -255,97 +176,67 @@ cmd_stop() {
     done
     warn "still up after ${DRAIN_WAIT}s; forcing"
     for j in $(job_ids); do scancel "$j" 2>/dev/null; done
-    sleep 5
-    info "stopped; supervision paused."
+    sleep 5; info "stopped; supervision paused."
 }
 
 cmd_restart() {
-    [ -n "${1:-}" ] && select_profile "$1"
-    # cmd_stop/cmd_start each take the lock; flock on the same fd in the same shell is
-    # re-entrant, so this is safe and keeps the whole cycle exclusive.
     take_lock wait || die "another serving operation is in progress"
     cmd_stop
-    # vLLM releases ~88 GiB back to the unified pool asynchronously. Starting too soon
-    # trips vLLM's own free-memory gate, so wait for the machine to actually settle.
+    # The engine releases ~90 GiB per node back to the unified pool asynchronously; let it settle.
     printf 'waiting for memory to be released '
     local i=0
-    while [ "$i" -lt 90 ]; do
-        printf '.'; sleep 5; i=$((i + 5))
-        [ -z "$(job_state)" ] && [ "$i" -ge 20 ] && break
-    done
+    while [ "$i" -lt 90 ]; do printf '.'; sleep 5; i=$((i + 5)); [ -z "$(job_state)" ] && [ "$i" -ge 20 ] && break; done
     printf ' done\n'
-    cmd_start "$@"
+    cmd_start
+}
+
+fair_stats_line () {
+    curl -s -m 5 "http://127.0.0.1:$PORT/fair-stats" 2>/dev/null | python3 -c "$(cat <<'PYEOF'
+import json, sys
+d = json.load(sys.stdin)
+print(f"{sum(d['in_flight'].values())}/{d['total_slots']} slots in use, by user {d['in_flight']}, queued {d['queued']}")
+PYEOF
+)" 2>/dev/null
 }
 
 cmd_status() {
-    if [ -f "$ROOT/logs/STATUS" ]; then
-        printf '\n%s*** %s ***%s\n' "$c_red" "SUPERVISION HAS GIVEN UP" "$c_off"
-        sed 's/^/  /' "$ROOT/logs/STATUS"
-    fi
+    [ -f "$ROOT/logs/STATUS" ] && { printf '\n%s*** SUPERVISION HAS GIVEN UP ***%s\n' "$c_red" "$c_off"; sed 's/^/  /' "$ROOT/logs/STATUS"; }
+    [ -f "$ROOT/logs/.paused" ] && printf '\n%ssupervision paused%s (serving stop); serving start resumes it\n' "$c_yel" "$c_off"
     local st node j code
     st=$(job_state); j=$(job_id); node=$(job_node)
-    printf '\n%s=== job ===%s\n' "$c_dim" "$c_off"
-    if [ -z "$st" ]; then
-        printf '  %sNOT RUNNING%s   (serving start)\n' "$c_red" "$c_off"
-    else
-        printf '  %s%s%s  job %s on %s  (elapsed %s)\n' "$c_grn" "$st" "$c_off" "$j" "$node" \
-            "$(squeue -h -j "$j" -o '%M' 2>/dev/null)"
-    fi
-
+    printf '\n%s=== engine job ===%s\n' "$c_dim" "$c_off"
+    if [ -z "$st" ]; then printf '  %sNOT RUNNING%s   (serving start)\n' "$c_red" "$c_off"
+    else printf '  %s%s%s  job %s on %s  (elapsed %s)\n' "$c_grn" "$st" "$c_off" "$j" "$node" \
+             "$(squeue -h -j "$j" -o '%M' 2>/dev/null)"; fi
     printf '\n%s=== reachability (this host) ===%s\n' "$c_dim" "$c_off"
     code=$(health)
-    printf '  model profile        %s%s%s%s\n' "$c_grn" "$MODEL_PROFILE" "$c_off" \
-        "$([ -n "${SITE_MODEL_PROFILE:-}" ] && [ "$MODEL_PROFILE" != "$SITE_MODEL_PROFILE" ] \
-            && printf '  (operator override; Ansible declares %s -- clear with: rm %s)' \
-                      "$SITE_MODEL_PROFILE" "$PROFILE_STATE")"
-    if [ "$code" = "200" ]; then printf '  /health              %s200%s\n' "$c_grn" "$c_off"
+    if [ "$code" = "200" ]; then printf '  /health              %s200%s  model %s\n' "$c_grn" "$c_off" "$(served_model)"
     else printf '  /health              %s%s%s  (endpoint not answering)\n' "$c_red" "${code:-000}" "$c_off"; fi
-    local nokey; nokey=$(curl -s -m 8 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/v1/models")
-    if [ "$nokey" = "200" ]; then
-        printf '  auth mode            %sSSH-only%s — any key in the trusted list can use it\n' "$c_grn" "$c_off"
-        printf '  /v1/models           200 (no API key needed once tunnelled)\n'
-    elif [ "$nokey" = "401" ]; then
-        printf '  auth mode            API key required\n'
-        printf '  /v1/models  +key     %s\n' "$(curl -s -m 8 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(first_key)" "http://127.0.0.1:$PORT/v1/models")"
-        printf '  /v1/models  no key   401  (enforced)\n'
+    printf '  keyed listener       %s without a key (401 expected)\n' \
+        "$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://$LOGIN_CLUSTER_IP:$KEYED_PORT/v1/models")"
+    if [ "$code" = "200" ]; then
+        printf '\n%s=== live load ===%s\n' "$c_dim" "$c_off"
+        curl -s -m 8 "http://127.0.0.1:8005/metrics" 2>/dev/null | awk '
+          /^vllm:num_requests_running\{/      {printf "  in flight            %d\n", $2}
+          /^vllm:num_requests_waiting\{/      {printf "  queued in engine     %d\n", $2}
+          /^vllm:kv_cache_usage_perc\{/       {printf "  kv cache used        %.1f%%\n", $2*100}
+          /^vllm:prefix_cache_queries_total\{/{q=$2}
+          /^vllm:prefix_cache_hits_total\{/   {h=$2}
+          /^vllm:num_preemptions_total\{/     {p=$2}
+          END { if (q>0) printf "  prefix cache hits    %.1f%% of queried tokens\n", 100*h/q
+                printf "  preemptions          %d since boot\n", p }'
+        printf '  fair-proxy           %s\n' "$(fair_stats_line)"
     else
-        printf '  /v1/models           %s%s%s (unexpected)\n' "$c_red" "$nokey" "$c_off"
+        printf '\nrun %sserving doctor%s for a diagnosis\n' "$c_yel" "$c_off"
     fi
-    [ -n "$node" ] && printf '  %s:%s from network  %s  (000 = not publicly exposed)\n' "$node" "$PORT" \
-        "$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://$node:$PORT/health")"
-
-    [ "$code" = "200" ] || { printf '\nrun %sserving doctor%s for a diagnosis\n' "$c_yel" "$c_off"; return 1; }
-
-    printf '\n%s=== live load ===%s\n' "$c_dim" "$c_off"
-    curl -s -m 8 "http://127.0.0.1:$PORT/metrics" 2>/dev/null | awk '
-      /^vllm:num_requests_running\{/      {printf "  in flight            %d\n", $2}
-      /^vllm:num_requests_waiting\{/      {printf "  queued               %d\n", $2}
-      /^vllm:kv_cache_usage_perc\{/      {printf "  kv cache used        %.1f%%\n", $2*100}
-      /^vllm:prefix_cache_queries_total\{/{q=$2}
-      /^vllm:prefix_cache_hits_total\{/   {h=$2}
-      /^vllm:spec_decode_num_draft_tokens_total\{/   {d=$2}
-      /^vllm:spec_decode_num_accepted_tokens_total\{/{a=$2}
-      END {
-        if (q>0) printf "  prefix cache hits    %.1f%% of queried tokens\n", 100*h/q
-        if (d>0) printf "  MTP acceptance       %.1f%%  (%.2f tokens per forward pass)\n", 100*a/d, 1+a/(d/2)
-      }'
-    printf '\n%s=== companions (globus1) ===%s\n' "$c_dim" "$c_off"
-    "$ROOT/bin/webui" status 2>/dev/null | sed 's/^/  webui /'
-    if pgrep -f 'fair-proxy.py' >/dev/null 2>&1; then
-        printf '  fair-proxy on 127.0.0.1:8000 -> 8005 (per-user in-flight cap)\n'
-    else
-        printf '  fair-proxy NOT RUNNING — port 8000 is dead until supervise revives it\n'
-    fi
-    if pgrep -f 'repair-proxy.py' >/dev/null 2>&1; then
-        printf '  repair-proxy on 127.0.0.1:8001 (for Unsloth Studio; see CLIENTS.md)\n'
-    else
-        printf '  repair-proxy not running\n'
-    fi
-
+    printf '\n%s=== login-node services ===%s\n' "$c_dim" "$c_off"
+    cmd_services status
+    printf '  agent host jobs      %s\n' "$(squeue -h -o '%u %j' 2>/dev/null | awk '$2 ~ /^agent-host-/' | wc -l)"
     printf '\n%s=== clients ===%s\n' "$c_dim" "$c_off"
-    printf '  tunnel   ssh -N -L %s:127.0.0.1:%s globus1\n' "$PORT" "$PORT"
-    printf '  base_url http://localhost:%s/v1     model  %s\n' "$PORT" "$(served_model)"
-    printf '  browser  tunnel 8080 too, then http://localhost:8080\n\n'
+    printf '  tunnel   ssh -N -L 8000:127.0.0.1:8000 -L 8080:127.0.0.1:8080 -L 8090:127.0.0.1:8090 %s\n' "${LOGIN_FQDN:-<login-node>}"
+    printf '  api      http://localhost:8000/v1   model %s\n' "$(served_model)"
+    printf '  browser  http://localhost:8080 (chat)   http://localhost:8090 (agents)\n\n'
+    [ "$code" = "200" ]
 }
 
 cmd_logs() {
@@ -357,173 +248,149 @@ cmd_logs() {
 
 cmd_test() {
     [ "$(health)" = "200" ] || die "endpoint not answering; try 'serving doctor'"
-    "$ROOT/venv2/bin/python" "$ROOT/bin/smoke.py" "http://127.0.0.1:$PORT/v1" "$(first_key)"
+    "$WEBUI_VENV/bin/python" "$ROOT/bin/smoke.py" "http://127.0.0.1:$PORT/v1"
 }
 
 cmd_keys() {
-    case "${1:-list}" in
-        list)
-            printf '%-14s %s\n' USER KEY
-            grep -E '^KEY_' "$KEYS" | while IFS='=' read -r k v; do printf '%-14s %s\n' "${k#KEY_}" "$v"; done ;;
-        add)
-            [ -n "${2:-}" ] || die "usage: serving keys add <name>"
-            grep -qE "^KEY_$2=" "$KEYS" && die "$2 already has a key"
-            printf 'KEY_%s=sk-globus-%s-%s\n' "$2" "$2" "$(openssl rand -hex 16)" >> "$KEYS"
-            chmod 600 "$KEYS"
-            info "added $2; run 'serving restart' for it to take effect"
-            grep -E "^KEY_$2=" "$KEYS" ;;
-        revoke)
-            [ -n "${2:-}" ] || die "usage: serving keys revoke <name>"
-            grep -qE "^KEY_$2=" "$KEYS" || die "no key for $2"
-            cp "$KEYS" "$KEYS.bak"; grep -vE "^KEY_$2=" "$KEYS.bak" > "$KEYS"; rm -f "$KEYS.bak"
-            chmod 600 "$KEYS"
-            info "revoked $2; run 'serving restart' to enforce it" ;;
-        *) die "usage: serving keys [list|add <name>|revoke <name>]" ;;
-    esac
+    python3 - "$KEYS" "${1:-list}" "${2:-}" <<'PYEOF'
+import json, os, secrets, sys
+path, action, user = sys.argv[1], sys.argv[2], sys.argv[3]
+keys = json.load(open(path))
+def save():
+    tmp = path + ".tmp"
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f: json.dump(keys, f, indent=1)
+    os.replace(tmp, path)
+by_user = {u: k for k, u in keys.items()}
+if action == "list":
+    for u in sorted(by_user): print(f"{u:16} {by_user[u][:12]}...")
+elif action in ("add", "show"):
+    if not user: sys.exit("usage: serving keys add|show <user>")
+    if user not in by_user:
+        if action == "show": sys.exit(f"no key for {user}")
+        k = "sk-spark-" + secrets.token_urlsafe(24); keys[k] = user; save(); by_user[user] = k
+    print(by_user[user])
+elif action == "revoke":
+    if user not in by_user: sys.exit(f"no key for {user}")
+    del keys[by_user[user]]; save(); print(f"revoked {user} (fair-proxy re-reads the file; no restart)")
+else:
+    sys.exit("usage: serving keys list | add <user> | show <user> | revoke <user>")
+PYEOF
 }
 
 cmd_doctor() {
-    if [ -f "$ROOT/logs/STATUS" ]; then
-        printf '\n%s*** SUPERVISION HAS GIVEN UP ***%s\n' "$c_red" "$c_off"
-        sed 's/^/  /' "$ROOT/logs/STATUS"
-    fi
+    [ -f "$ROOT/logs/STATUS" ] && { printf '\n%s*** SUPERVISION HAS GIVEN UP ***%s\n' "$c_red" "$c_off"; sed 's/^/  /' "$ROOT/logs/STATUS"; }
     printf '\n%s=== diagnosis ===%s\n' "$c_dim" "$c_off"
-    local st log node
-    st=$(job_state); log=$(cur_log); node=$(job_node)
-
+    local st log; st=$(job_state); log=$(cur_log)
     if [ -z "$st" ]; then
-        printf '  %sno slurm job%s\n' "$c_red" "$c_off"
+        printf '  %sno engine job%s\n' "$c_red" "$c_off"
         local last; last=$(ls -1t "$ROOT"/logs/serve-*.out 2>/dev/null | head -1)
         if [ -n "$last" ]; then
             printf '  last job log: %s\n' "$last"
-            printf '  exit line   : %s\n' "$(grep -E 'vllm exited with code' "$last" | tail -1)"
-            local why
-            why=$(grep -oE 'CUDA out of memory|Free memory on device[^.]*|FileNotFoundError[^ ]*|Ninja build failed|code=137|Engine core initialization failed' "$last" | tail -1)
+            local why; why=$(grep -oE 'CUDA out of memory|checkpoint not prepared[^"]*|no completed conversion|Engine core initialization failed|KeyboardInterrupt|shutdown triggered|ncclInternalError|unhealthy 5x' "$last" | tail -1)
             [ -n "$why" ] && printf '  likely cause: %s%s%s\n' "$c_yel" "$why" "$c_off"
+            grep -q 'KeyboardInterrupt\|shutdown triggered' "$last" 2>/dev/null && \
+                printf '  (SIGTERM with no CUDA OOM = earlyoom on a node: lower ENGINE_KV_BYTES)\n'
         fi
         printf '  fix: serving start\n\n'; return 1
     fi
-
-    printf '  job %s is %s on %s\n' "$(job_id)" "$st" "$node"
-    if [ "$st" != "RUNNING" ]; then printf '  waiting for slurm to schedule it\n\n'; return 1; fi
-
-    if [ -n "$log" ] && ! grep -q 'Application startup complete' "$log" 2>/dev/null; then
-        printf '  %sstill starting%s — last milestone:\n' "$c_yel" "$c_off"
-        grep -E 'Model loading took|torch.compile took|GPU KV cache size|Capturing|profiling' "$log" 2>/dev/null | tail -1 | sed 's/^/    /'
-        printf '  cold start is ~5 min (weights 170s + compile + capture)\n\n'; return 1
-    fi
-
-    if [ "$(health)" != "200" ]; then
-        printf '  %sjob is up but the endpoint is not reachable here%s\n' "$c_red" "$c_off"
-        if grep -q 'WARNING: cannot publish' "$log" 2>/dev/null; then
-            printf '    the reverse tunnel to globus1 was never established\n'
-            printf '    fix: bash %s/bin/setup_reverse_tunnel.sh && serving restart\n' "$ROOT"
-        else
-            printf '    publisher line: %s\n' "$(grep -E 'publishing |publish preflight' "$log" 2>/dev/null | tail -1)"
-            printf '    the tunnel may have dropped; check: serving logs 40\n'
+    printf '  job %s is %s on %s\n' "$(job_id)" "$st" "$(job_node)"
+    [ "$st" != "RUNNING" ] && { printf '  waiting for slurm to schedule it\n\n'; return 1; }
+    if [ -n "$log" ] && [ "$(health)" != "200" ]; then
+        if ! tail -n 400 "$log" | grep -q 'Application startup complete'; then
+            printf '  %sstill starting%s; last milestone:\n' "$c_yel" "$c_off"
+            grep -E 'Model loading took|GPU KV cache size|Capturing|prewarm|launching vLLM' "$log" | tail -1 | sed 's/^/    /'
+            printf '  cold start is ~10 min\n\n'; return 1
         fi
-        printf '\n'; return 1
+        printf '  %sjob is up but the endpoint is not reachable here%s\n' "$c_red" "$c_off"
+        printf '    last publisher line: %s\n' "$(grep '\[publisher\]' "$log" | tail -1)"
+        printf '    check the tunnel key (serving install) and: serving logs 40\n\n'; return 1
     fi
-    printf '  %severything looks healthy%s\n\n' "$c_grn" "$c_off"
+    printf '  %sengine healthy%s\n' "$c_grn" "$c_off"; cmd_services status; printf '\n'
 }
 
-# Returns 0 if supervise should act now. Enforces backoff and a terminal give-up, so a
-# genuinely broken deployment cannot burn the node on a restart loop forever -- and, more
-# importantly, cannot look like "cron is handling it" while doing so.
+# Backoff and a terminal give-up, so a broken deployment cannot loop on the nodes forever, and cannot look like
+# "cron is handling it" while doing so.
 SUPER_STATE="$ROOT/logs/.supervise.state"
 SUPER_MAX=${SUPER_MAX:-5}
 supervise_attempt() {
-    local reason="$1" n=0 last=0 now wait_for
-    now=$(date +%s)
+    local reason="$1" n=0 last=0 now wait_for; now=$(date +%s)
     [ -f "$SUPER_STATE" ] && read -r n last < "$SUPER_STATE" 2>/dev/null
     n=${n:-0}; last=${last:-0}
     if [ "$n" -ge "$SUPER_MAX" ]; then
         [ -f "$ROOT/logs/STATUS" ] || {
             printf 'BROKEN since %s\nafter %d consecutive failed recoveries: %s\nsupervision has GIVEN UP; fix, then run: serving start\n' \
                 "$(date -Is)" "$n" "$reason" > "$ROOT/logs/STATUS"
-            logger -t qwen38-serve "GIVING UP after $n failed recoveries: $reason" 2>/dev/null
-            echo "[$(date -Is)] GIVING UP after $n failures ($reason)" >> "$ROOT/logs/supervise.log"
-        }
+            logger -t "$JOB" "GIVING UP after $n failed recoveries: $reason" 2>/dev/null
+            echo "[$(date -Is)] GIVING UP after $n failures ($reason)" >> "$ROOT/logs/supervise.log"; }
         return 1
     fi
     wait_for=$(( 300 * (1 << n) )); [ "$wait_for" -gt 3600 ] && wait_for=3600
-    if [ "$last" -ne 0 ] && [ $((now - last)) -lt "$wait_for" ]; then return 1; fi
+    [ "$last" -ne 0 ] && [ $((now - last)) -lt "$wait_for" ] && return 1
     printf '%d %d\n' "$((n + 1))" "$now" > "$SUPER_STATE"
-    logger -t qwen38-serve "recovery attempt $((n+1))/$SUPER_MAX: $reason" 2>/dev/null
     echo "[$(date -Is)] attempt $((n+1))/$SUPER_MAX ($reason)" >> "$ROOT/logs/supervise.log"
     return 0
 }
 
 cmd_supervise() {
-    # Intended for cron. Quiet when healthy; restarts only when genuinely down.
-    #
-    # Companions first (before the lock/paused gates — pausing the MODEL should not
-    # take these down with it): revive repair-proxy if gone, and keep the read-only
-    # user-facing mirror in /shared/llm current (colleagues cannot read this home dir).
-    if ! pgrep -f 'fair-proxy.py' >/dev/null 2>&1; then
-        nohup python3 "$ROOT/bin/fair-proxy.py" >> "$ROOT/logs/fair-proxy.log" 2>&1 &
-        echo "[$(date -Is)] restarted fair-proxy" >> "$ROOT/logs/supervise.log"
-    fi
-    if ! pgrep -f 'repair-proxy.py' >/dev/null 2>&1; then
-        nohup python3 "$ROOT/bin/repair-proxy.py" >> "$ROOT/logs/repair-proxy.log" 2>&1 &
-        echo "[$(date -Is)] restarted repair-proxy" >> "$ROOT/logs/supervise.log"
-    fi
-    if [ -d /shared/llm ] && [ -n "$LOGIN_FQDN" ]; then
-        # The repo keeps <login-node> placeholders so it can be public; the mirror
-        # gets the real hostname substituted in, so colleagues can copy-paste.
+    # Login services first, independent of the engine's pause/lock gates.
+    local s; for s in fair-proxy webui dashboard; do svc_running "$s" || svc_start "$s" >/dev/null 2>&1; done
+    if [ -d "$SHARED_MIRROR" ] && [ -n "${LOGIN_FQDN:-}" ]; then
+        # The repo keeps <login-node> placeholders so it can be public; the mirror gets the real hostname.
         local f
-        for f in QUICKSTART.md CLIENTS.md README.md DESIGN.md bin/chat.py bin/llm-tunnel; do
-            sed "s|<login-node>|$LOGIN_FQDN|g" "$ROOT/$f" > "/shared/llm/$(basename "$f")" 2>/dev/null
+        for f in QUICKSTART.md CLIENTS.md README.md bin/chat.py bin/llm-tunnel; do
+            [ -f "$ROOT/$f" ] && sed "s|<login-node>|$LOGIN_FQDN|g" "$ROOT/$f" > "$SHARED_MIRROR/$(basename "$f")" 2>/dev/null
         done
-        for f in opencode.json globus_inference.py alcf_style.py openai_api.py; do
-            cp -u "$ROOT/examples/$f" /shared/llm/examples/ 2>/dev/null
-        done
-        chmod a+rx /shared/llm/chat.py /shared/llm/llm-tunnel 2>/dev/null
-        chmod -R a+rX,go-w /shared/llm 2>/dev/null
+        mkdir -p "$SHARED_MIRROR/examples"; cp -u "$ROOT"/examples/* "$SHARED_MIRROR/examples/" 2>/dev/null
+        chmod a+rx "$SHARED_MIRROR/chat.py" "$SHARED_MIRROR/llm-tunnel" 2>/dev/null
+        chmod -R a+rX,go-w "$SHARED_MIRROR" 2>/dev/null
     fi
-
-    # Lock first: the cron fires every 5 min but a restart (drain + memory settle + a ~5 min
-    # cold start) takes longer than that, so without this a slow restart would have a second
-    # supervise run tear it down half-way through and the endpoint would flap indefinitely.
-    [ -f "$ROOT/logs/.paused" ] && exit 0          # 'serving stop' means stopped
-    take_lock nowait || exit 0                      # a human operation is in progress
-
-    # Refuse to act on an unreadable cluster state, or we submit duplicates forever.
-    squeue -h -u "$ME" -o '%i' >/dev/null 2>&1 || exit 0
-
-    local st code
-    st=$(job_state); code=$(health)
+    [ -f "$ROOT/logs/.paused" ] && exit 0
+    take_lock nowait || exit 0
+    squeue -h -u "$ME" -o '%i' >/dev/null 2>&1 || exit 0    # unreadable cluster state: never submit blind
+    local st code; st=$(job_state); code=$(health)
     if [ -n "$st" ] && [ "$code" = "200" ]; then rm -f "$SUPER_STATE" "$ROOT/logs/STATUS"; exit 0; fi
-    if [ -n "$st" ] && [ "$st" != "RUNNING" ]; then exit 0; fi          # pending: leave it alone
+    [ -n "$st" ] && [ "$st" != "RUNNING" ] && exit 0         # pending: leave it alone
     if [ -n "$st" ]; then
-        # Do NOT grep the log for 'Application startup complete': --open-mode=append plus a
-        # requeue reusing the same JobId means last run's marker is present immediately, so
-        # the guard would fire against a perfectly healthy reloading job. Elapsed time is
-        # reset by a requeue and is therefore the honest signal.
-        local mins; mins=$(squeue -h -j "$(job_id)" -o '%M' 2>/dev/null)
-        secs=$(awk -F: '{n=NF; s=$n; if(n>1) s+=60*$(n-1); if(n>2) s+=3600*$(n-2); print s}' <<<"${mins:-0:00}")
-        # Cold-boot grace comes from the profile: the 27B loads in well under 12 min,
-        # Flash-Next takes 700-800 s and would otherwise be restarted mid-boot in a loop.
-        [ "${secs:-0}" -lt "$PROFILE_COLDSTART" ] && exit 0
+        # Elapsed time (reset by a requeue) is the honest boot signal; the log keeps last run's markers.
+        local t secs; t=$(squeue -h -j "$(job_id)" -o '%M' 2>/dev/null)
+        secs=$(awk -F'[-:]' '{n=NF; s=$n; if(n>1) s+=60*$(n-1); if(n>2) s+=3600*$(n-2); if(n>3) s+=86400*$(n-3); print s}' <<<"${t:-0:00}")
+        [ "${secs:-0}" -lt "$COLDSTART" ] && exit 0
         supervise_attempt "unhealthy (http ${code:-000})" || exit 0
-        cmd_restart >> "$ROOT/logs/supervise.log" 2>&1
-        exit 0
+        cmd_restart >> "$ROOT/logs/supervise.log" 2>&1; exit 0
     fi
     supervise_attempt "no job present" || exit 0
-    require_profile
-    (cd "$ROOT" && sbatch "${SBATCH_ARGS[@]}" bin/serve.sh) >> "$ROOT/logs/supervise.log" 2>&1
+    (cd "$ROOT" && sbatch "${SBATCH_ARGS[@]}" "$SERVE") >> "$ROOT/logs/supervise.log" 2>&1
+}
+
+# ---------------------------------------------------------------- one-time setup
+cmd_install() {
+    local key=$HOME/.ssh/id_llm_tunnel auth=$HOME/.ssh/authorized_keys label=llm-reverse-tunnel
+    [ -f "$key" ] || ssh-keygen -q -t ed25519 -N '' -f "$key" -C "$label"
+    touch "$auth"; chmod 600 "$auth"; cp "$auth" "$auth.bak.$(date +%s)"
+    grep -v " $label\$" "$auth" > "$auth.tmp"; mv "$auth.tmp" "$auth"
+    # The engine job's key may do exactly one thing: listen on the login node's 127.0.0.1:8005. restrict = no
+    # shell/pty/agent/X11; permitopen 127.0.0.1:1 blocks -L; command=/bin/false because restrict alone allows it.
+    printf 'restrict,port-forwarding,permitlisten="127.0.0.1:8005",permitopen="127.0.0.1:1",command="/bin/false" %s %s\n' \
+        "$(awk '{print $1" "$2}' "$key.pub")" "$label" >> "$auth"
+    chmod 600 "$auth"; info "tunnel key: may listen on 127.0.0.1:8005 only"
+    local cron="*/5 * * * * $ROOT/bin/serving supervise >/dev/null 2>&1  # serving"
+    ( crontab -l 2>/dev/null | grep -v '# serving$'; echo "$cron" ) | crontab -
+    info "cron: $cron"
+    cmd_services start
 }
 
 case "${1:-status}" in
-    start)     shift; cmd_start "$@" ;;
-    stop)      shift; cmd_stop "$@" ;;
-    restart)   shift; cmd_restart "$@" ;;
-    status|"") shift 2>/dev/null; cmd_status ;;
+    start)     shift; cmd_start ;;
+    stop)      shift; cmd_stop ;;
+    restart)   shift; cmd_restart ;;
+    status|"") cmd_status ;;
     logs)      shift; cmd_logs "$@" ;;
-    test)      shift; cmd_test "$@" ;;
+    test)      shift; cmd_test ;;
     keys)      shift; cmd_keys "$@" ;;
-    doctor)    shift; cmd_doctor "$@" ;;
-    supervise) shift; cmd_supervise "$@" ;;
-    -h|--help|help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' ;;
+    doctor)    shift; cmd_doctor ;;
+    supervise) shift; cmd_supervise ;;
+    install)   shift; cmd_install ;;
+    services)  shift; cmd_services "$@" ;;
+    -h|--help|help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) die "unknown command '$1' (try: serving help)" ;;
 esac

@@ -44,5 +44,10 @@ if [ "$MODE" = hybrid ]; then
 import json;m=json.load(open('${SNAP}-fp8hybrid/model.safetensors.index.json'))['weight_map']
 n=sum(1 for k in m if k.endswith('weight_scale_inv'))
 assert n>0, 'no fp8 tensors'; print(n)\""
+  chk "tp2 checkpoint prepared"        "[ -f '${SNAP}-fp8hybrid-tp2/.prepared' ] && grep -q '^done. worst per-tensor' '${SNAP}-fp8hybrid-tp2/fp8_convert.log'"
+  chk "tp2 keeps shared expert bf16"   "PYTHONPATH='$SP' python3.12 -c \"
+import json;m=json.load(open('${SNAP}-fp8hybrid-tp2/model.safetensors.index.json'))['weight_map']
+bad=[k for k in m if 'shared_expert' in k and k.endswith('weight_scale_inv')]
+assert not bad, bad[:3]; print('ok')\""
 fi
 exit $F

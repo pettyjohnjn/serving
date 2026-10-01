@@ -13,3 +13,6 @@ venv-webui/
 etc/site.env
 tools/flash-next/logs/
 tools/flash-next/flash-dgx/
+state/
+jobs/__pycache__/
+workbench/__pycache__/
