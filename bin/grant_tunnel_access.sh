@@ -13,7 +13,7 @@
 # distributing and trusting keys already exists.
 #
 # NOTE: this grants access under YOUR account. Anyone you add can reach the endpoint as
-# a network destination, so give them their own vLLM API key from etc/keys.env too if
+# a network destination; for per-person attribution give them a key (bin/serving keys add) if
 # you want per-person attribution in the logs.
 
 set -euo pipefail

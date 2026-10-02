@@ -1,126 +1,57 @@
 # serving
 
-An OpenAI-compatible inference endpoint for Qwen3.8-27B on a DGX Spark (GB10)
-slurm cluster, shared by a small research group. SSH is the only credential:
-if you can reach the login node, you can use the model — there are no API keys,
-no accounts, no passwords anywhere in the stack.
+A shared, OpenAI-compatible LLM endpoint for a small lab, plus a browser chat UI and an agent workbench, on a Slurm
+cluster of DGX Sparks (GB10). One model: **Qwen3.8-Flash-Next** (125B MoE, ~6B active; NVFP4 experts, FP8 dense
+layers), served by vLLM across **two Sparks with tensor parallelism** over their RoCE link.
 
-## Quick start
+- **Users** read [QUICKSTART.md](QUICKSTART.md) (connect in two minutes) and [CLIENTS.md](CLIENTS.md) (every
+  client, from curl to coding agents).
+- **Operators** read [ADMIN.md](ADMIN.md) (deploy, operate, what needs root). Why it is built this way, with the
+  measurements: [DESIGN.md](DESIGN.md).
 
-Open a tunnel to the login node and leave it running:
+## What runs where
 
-```bash
-ssh -N -L 8000:127.0.0.1:8000 -L 8080:127.0.0.1:8080 globus1
+```
+laptop --ssh -L 8000/8080/8090--> login node (service account, bin/serving)
+                                   127.0.0.1:8000  fair-proxy      fair-share admission, users by account
+                                   <cluster-ip>:8001  fair-proxy   same pool, users by API key (agent jobs)
+                                   127.0.0.1:8080  identity proxy -> Open WebUI   (logged in as your cluster account)
+                                   127.0.0.1:8090  identity proxy -> agent dashboard
+                                   127.0.0.1:8005  <- reverse tunnel from the engine
+engine nodes (2 x GB10):           vLLM, TP2, bf16 KV (3.4M tokens), 32 slots     jobs/serve.sbatch
+other compute nodes:               one Slurm job per person holding all their Pi agent sessions
+                                                                                  jobs/agent-host.sbatch
 ```
 
-Then either open **http://localhost:8080** and chat in the browser (you are
-logged in automatically as your cluster account), or point any OpenAI client at
-the API:
-
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="sk-local")
-r = client.chat.completions.create(
-    model="qwen3.8-27b",
-    messages=[{"role": "user", "content": "Hello!"}],
-    max_tokens=256,
-)
-print(r.choices[0].message.content)
-```
-
-The `api_key` is a placeholder the SDK insists on; the server ignores it.
-[QUICKSTART.md](QUICKSTART.md) is this in more detail; [CLIENTS.md](CLIENTS.md)
-covers tools and agents (opencode, aider, structured output, images) and the
-browser UI's features.
-
-## What to expect
-
-| | |
-|---|---|
-| model | Qwen3.8-27B, NVFP4 weights, thinking model (default effort `medium`) |
-| context window | 262,144 tokens per request |
-| speed, solo | ~20–25 tok/s, first token in ~0.3 s |
-| speed, busy | ~11 tok/s each at the 32-request cap; overflow queues, nothing is dropped |
-| long prompts | cold prefill ~1,000 tok/s; prefix caching makes repeat context ~14× faster |
-| fairness | work-conserving: one user may fill all 32 slots, but under contention freed slots go to whoever holds least |
-| live stats | http://localhost:8080/globus-stats — tok/s, load, GPU, queue, token history, uptime |
-| availability | supervised via cron; survives node reboots and the 2-day slurm limit with a ~7 min blip |
+Nothing listens on a public interface: the engine binds its head node's loopback and publishes to the login node
+over a reverse SSH tunnel whose key can do nothing else; the login-node services bind loopback (the keyed listener
+binds the cluster network and refuses requests without a valid key).
 
 ## Operating it
 
-Everything goes through one command on the login node:
+```
+serving status        engine job, reachability, live load, services
+serving start|stop|restart
+serving doctor        diagnose a broken or unreachable endpoint
+serving keys add <user>        API key for the keyed listener (agents get theirs automatically)
+serving supervise     cron, every 5 min: keeps everything up, resubmits a dead engine with backoff
+tools/validate/validate.sh quick|full    acceptance tests against the running engine
+```
+
+## Layout
 
 ```
-serving start|stop|restart      lifecycle (slurm job + drain)
-serving status                  job, reachability, load, companion processes
-serving test                    smoke suite against the live endpoint
-serving doctor                  diagnose a broken endpoint
-serving supervise               cron entry; revives anything that died
+bin/serving                 the CLI (engine lifecycle, login services, keys, install, supervise)
+bin/fair-proxy.py           fair-share admission (loopback + keyed listeners)
+bin/webui, webui-idproxy.py Open WebUI and the identity proxy (also fronts the dashboard), status page
+bin/install-webui-env.sh    x86 Open WebUI environment
+bin/install-agent-tools.sh  aarch64 Node + Pi + ttyd for agent jobs
+jobs/serve.sbatch           the engine (two nodes)
+jobs/agent-host.sbatch      a person's agent host job
+workbench/                  dashboard (login node) and supervisor (inside agent host jobs)
+tools/flash-next/           builds the vLLM tree and checkpoints on each engine node (fn build / fn verify)
+tools/validate/             benchmarks and acceptance tests
+etc/site.env.example        every site value; copy to etc/site.env (git-ignored)
+ansible/                    operator-level playbook
+examples/                   client snippets
 ```
-
-The browser UI has its own `bin/webui start|stop|status|ensure`. Site-specific
-names (compute node, login hostname) live in `etc/site.env` — copy
-`etc/site.env.example` and fill it in. `ansible/` rebuilds the whole stack on a
-fresh operator account.
-
-## More
-
-[DESIGN.md](DESIGN.md) holds the long version: why every configuration value is
-what it is, the measured performance tables, the security and privacy model, and
-the operational drills the failure numbers come from.
-
-## Model profiles
-
-The endpoint can serve more than one model. Everything model-specific lives in
-`etc/models/<profile>.env`: the weights path, the runtime that can load them, the
-tuned defaults, extra flags and extra environment. Everything else — the reverse
-tunnel, fair-proxy, the auth policy, draining and requeue — is shared.
-
-    serving start                       # the declared default (qwen38-27b)
-    serving restart qwen38-flash-next   # switch
-    serving restart qwen38-27b          # roll back
-
-The choice sticks. `serving supervise` resubmits from a timer with no arguments, so
-without a record of it the next supervised restart would quietly bring back the other
-model; it is written to `logs/.model-profile` instead. `serving status` always prints
-the active profile, and when it differs from `MODEL_PROFILE` in `etc/site.env` it says
-so rather than leaving the drift silent:
-
-    model profile        qwen38-flash-next  (operator override; Ansible declares
-                         qwen38-27b -- clear with: rm logs/.model-profile)
-
-That file lives in `logs/` and not `etc/` on purpose: under configuration management
-`etc/` is re-templated on every apply, and an apply must not revert an operator's
-choice in the middle of an incident.
-
-The served model name changes with the profile (`qwen3.8-27b` becomes
-`qwen3.8-flash-next`), so a client that hardcodes a name breaks on a swap. The repo's
-own tooling (`serving status`, `chat.py`, `smoke.py`, the status page) asks the server
-instead. To keep one stable name across swaps, set `SERVED_NAME` in `etc/site.env`;
-it applies to whichever profile is running, so pick something model-neutral.
-
-The lower-level form still works and is what `serve.sh` sees:
-
-    sbatch --export=ALL,MODEL_PROFILE=qwen38-flash-next bin/serve.sh
-
-The profile is sourced before the tunables in `serve.sh`, so those become fallbacks.
-Selecting `qwen38-27b` produces a byte-identical flag set to how the endpoint ran
-before profiles existed; `DRY_RUN=1 bin/serve.sh` prints the argv and exits, which is
-how that is checked without touching production.
-
-| | qwen38-27b | qwen38-flash-next |
-|---|---|---|
-| runtime | `venv2/bin/vllm` (0.27.1) | extracted official image, host python3.12 |
-| weights | `/scratch/models/Qwen3.8-27B-NVFP4` | `/scratch/hf/...-fp8hybrid` |
-| max seqs | 32 | 8 |
-| speculation | qwen3_5_mtp, 3 | mtp, 1 |
-| KV | fp8, pinned pool | bf16 |
-| tool parser | qwen3_xml | qwen3_coder |
-
-Flash-Next needs its runtime built and verified first:
-
-    tools/flash-next/bin/fn build && tools/flash-next/bin/fn verify
-
-The profile refuses to start if the weights or the prepared hybrid checkpoint are
-missing, rather than falling through to the 27B default.

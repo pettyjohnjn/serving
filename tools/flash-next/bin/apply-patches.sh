@@ -2,7 +2,7 @@
 # Apply the patch stack to the extracted image tree. Idempotent: each step is
 # marker-guarded, and every edit asserts its anchor so a moved upstream fails
 # loudly instead of silently no-opping. Runs on the compute node.
-#   env: SP REPO MODPKG [KDET KDETDIR DET_ARCH BUILD_KERNEL]
+#   env: SP REPO MODPKG [KDET KDETDIR DET_ARCH BUILD_KERNEL SKIP]
 set -uo pipefail
 : "${SP:?}" "${MODPKG:?}"
 # REPO holds the patch sources; the kernel build (BUILD_KERNEL=1) fetches its own and
@@ -12,11 +12,20 @@ py () { PYTHONPATH="$SP" PYTHONNOUSERSITE=1 python3.12 "$@"; }
 MARK=$SP/.fn-patches; mkdir -p "$MARK"
 M=$SP/vllm/models/$MODPKG/nvidia
 PLE=$M/ple_layer.py; QSA_OPS=$M/ops/qsa.py; QSA_TOP=$M/qsa.py
+# vLLM main moved the QSA top-k (the det-kernel anchor) from ops/qsa.py into ops/qsa_indexer.py
+# as a module-level function (Sep 2026, qwen4_exp). Patch 8 goes to whichever file holds it.
+QSA_DET_FILE=$QSA_OPS
+[ -f "$M/ops/qsa_indexer.py" ] && grep -q "torch.ops._C.persistent_topk" "$M/ops/qsa_indexer.py" && QSA_DET_FILE=$M/ops/qsa_indexer.py
 MU=$SP/vllm/v1/worker/mamba_utils.py
 MO=$SP/vllm/model_executor/layers/quantization/modelopt.py
 FLA_U=$SP/vllm/third_party/flash_linear_attention/ops/utils.py
 FLA_C=$SP/vllm/third_party/flash_linear_attention/ops/chunk_delta_h.py
-step () { [ -f "$MARK/$1" ] && { echo "  -- $1 $2 (already)"; return 1; }; echo "  >> $1 $2"; return 0; }
+# SKIP="1 7": leave those patch numbers out, e.g. when an overlay already covers them.
+step () {
+  case " ${SKIP:-} " in *" $1 "*) echo "  -- $1 $2 (skipped via SKIP)"; return 1 ;; esac
+  [ -f "$MARK/$1" ] && { echo "  -- $1 $2 (already)"; return 1; }
+  echo "  >> $1 $2"; return 0
+}
 # class name follows the package name: qwen3_8_flash_next -> Qwen3_8FlashNext...
 case "$MODPKG" in
   qwen3_8_flash_next) NGRAM_CLS=Qwen3_8FlashNextNGramEmbedding ;;
@@ -90,6 +99,9 @@ if step 8 "deterministic top-k kernel"; then
       PATH="$NINJA:$PATH" CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}" \
       PYTHONPATH="$SP" PYTHONNOUSERSITE=1 python3.12 build_det.py 2>&1 | tail -3 ) || exit 1
   cp "$KDETDIR/build/_C_det.so" "$KDETDIR/_C_det.so"
-  VLLM_QSA_PY="$QSA_OPS" py "$KDETDIR/qsadet_patch.py" || exit 1
-  py -c "import ast;ast.parse(open('$QSA_OPS').read())" && touch "$MARK/8"
+  # The upstream patch script hard-codes the anchor's indent and enclosing-function name from the
+  # old ops/qsa.py; bin/reindent-qsadet.py adapts a private copy to the actual target.
+  py "$FN_HOME/bin/reindent-qsadet.py" "$KDETDIR/qsadet_patch.py" "$QSA_DET_FILE" "$KDETDIR/qsadet_patch.local.py" || exit 1
+  VLLM_QSA_PY="$QSA_DET_FILE" py "$KDETDIR/qsadet_patch.local.py" || exit 1
+  py -c "import ast;ast.parse(open('$QSA_DET_FILE').read())" && touch "$MARK/8"
 fi

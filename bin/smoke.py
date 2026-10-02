@@ -8,12 +8,12 @@ import time
 
 import httpx
 
-BASE = sys.argv[1] if len(sys.argv) > 1 else "http://globus3:8000/v1"
+BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000/v1"
 # Default policy is SSH-only, where no key exists and vLLM ignores the header. Requiring
 # argv[2] made this crash with an IndexError in exactly the mode we ship.
 KEY = sys.argv[2] if len(sys.argv) > 2 else "sk-local"
 H = {"Authorization": f"Bearer {KEY}"}
-# The endpoint serves whichever profile was selected (see etc/models/), so the model
+# The served model name can change (SERVED_NAME in etc/site.env), so the model
 # name cannot be hardcoded or this suite fails on every model but one. Ask the server.
 # SMOKE_MODEL overrides, e.g. to target one entry on a multi-model endpoint.
 def _served_model():
@@ -26,7 +26,7 @@ def _served_model():
             return ids[0]
     except Exception:
         pass
-    return "qwen3.8-27b"
+    return "qwen3.8-flash-next"
 
 
 MODEL = _served_model()

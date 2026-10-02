@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""chat.py — minimal client for the globus Qwen3.8-27B endpoint. Stdlib only.
+"""chat.py — minimal client for the globus Qwen3.8-Flash-Next endpoint. Stdlib only.
 
 Copy this to your laptop. No pip install, no dependencies, no API key.
 
@@ -26,11 +26,11 @@ import sys
 import urllib.error
 import urllib.request
 
-MODEL = "qwen3.8-27b"   # fallback only; main() asks the server what it is serving
+MODEL = "qwen3.8-flash-next"   # fallback only; main() asks the server what it is serving
 
 
 def _served_model(base):
-    """The endpoint serves whichever profile was selected (see etc/models/), so ask it
+    """The served model name can change (SERVED_NAME in etc/site.env), so ask it
     rather than hardcode a name. CHAT_MODEL overrides. A server that is down falls
     back to the default; the request itself then fails with the usual message."""
     if os.environ.get("CHAT_MODEL"):

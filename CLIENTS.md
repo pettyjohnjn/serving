@@ -1,9 +1,9 @@
-# Connecting to the Qwen3.8-27B endpoint
+# Connecting to the Qwen3.8-Flash-Next endpoint
 
 New here? [QUICKSTART.md](QUICKSTART.md) gets you from zero to a first response.
 
 **Base URL:** `http://localhost:8000/v1` — after opening the tunnel (see below)
-**Model name:** `qwen3.8-27b`
+**Model name:** `qwen3.8-flash-next`
 **Auth:** your SSH key — nothing else. If you can SSH to globus1, you can use the model.
 
 It is an OpenAI-compatible API, so anything that speaks "OpenAI base URL + key" works.
@@ -46,7 +46,7 @@ API key to hand out, rotate, or leak.
 ssh -N -L 8000:127.0.0.1:8000 globus1
 ```
 
-Then point any OpenAI-compatible tool at **`http://localhost:8000/v1`**, model `qwen3.8-27b`.
+Then point any OpenAI-compatible tool at **`http://localhost:8000/v1`**, model `qwen3.8-flash-next`.
 Any value works as the API key (most clients insist on sending something) — `sk-local` is fine.
 
 Make it permanent in `~/.ssh/config` — the same pattern you already use for the dashboard on
@@ -57,7 +57,7 @@ Host globus1
     HostName            <login-node>
     User                <your-cluster-user>
     LocalForward        3000 localhost:3000      # dashboard
-    LocalForward        8000 localhost:8000      # Qwen3.8-27B endpoint
+    LocalForward        8000 localhost:8000      # model endpoint
     ServerAliveInterval 20
     ExitOnForwardFailure yes
 ```
@@ -83,7 +83,7 @@ Or copy `bin/llm-tunnel` for a version that reconnects on drop:
 ./llm-tunnel --port 9000
 ```
 
-To verify, `curl http://localhost:8000/v1/models` should list `qwen3.8-27b`.
+To verify, `curl http://localhost:8000/v1/models` should list `qwen3.8-flash-next`.
 
 ### Giving someone LLM access without giving them a shell
 
@@ -172,8 +172,8 @@ nothing is listening on localhost:8000 — the SSH tunnel is not up.
 ```
 ```
 the tunnel on localhost:8000 is up, but nothing is serving behind it (ConnectionResetError).
-  the model may still be loading — a cold start is ~5 min
-  check:     ssh globus1 serving status
+  the model may still be loading (a cold start is ~10 min, and the engine renews itself every 2 days)
+  check:     http://localhost:8080/globus-stats (tunnel 8080 too)
 ```
 
 `examples/openai_api.py` is a runnable tour: basic, streaming, reasoning control, tool
@@ -182,10 +182,11 @@ calling, JSON schema, images.
 Notes that matter when you drive it hard:
 
 - Concurrency: 32 requests are admitted at once; the rest queue, nothing is dropped.
-  Aggregate throughput is ~139 tok/s at 8 concurrent, 230 at 16, 323 at 32, while
-  per-request speed falls from ~24 tok/s solo to ~11 at 32.
-- Prefix caching is the big lever. A cold 36K-token context costs ~28 s of prefill; the
-  same prefix again costs ~2 s. Put shared content (system prompt, documents, few-shot
+  Aggregate throughput is ~183 tok/s at 8 concurrent, 264 at 16, 367 at 32, while
+  per-request speed falls from ~45 tok/s solo to ~11 at 32 (with 64K-token contexts: ~47 solo, ~16 at 16,
+  ~10 at 32). The KV cache holds 3.4M tokens, so ~40 conversations of 80K tokens stay cached at once.
+- Prefix caching is the big lever. A cold 24K-token context costs ~11 s of prefill; the
+  same prefix again costs ~0.7 s. Put shared content (system prompt, documents, few-shot
   examples) first and vary only the tail.
 - Structured output uses the standard `response_format={"type": "json_schema", ...}`,
   not vLLM's older `guided_json`.
@@ -201,7 +202,7 @@ from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="sk-local")
 
 r = client.chat.completions.create(
-    model="qwen3.8-27b",
+    model="qwen3.8-flash-next",
     messages=[{"role": "user", "content": "Refactor this function for clarity: ..."}],
     max_tokens=2048,
     extra_body={"chat_template_kwargs": {"reasoning_effort": "low"}},
@@ -229,7 +230,7 @@ without reading the opencode section.)
 curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer sk-local" \
   -H "Content-Type: application/json" \
-  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"hi"}],"max_tokens":256}'
+  -d '{"model":"qwen3.8-flash-next","messages":[{"role":"user","content":"hi"}],"max_tokens":256}'
 ```
 
 ## aider
@@ -237,7 +238,7 @@ curl http://localhost:8000/v1/chat/completions \
 ```bash
 export OPENAI_API_BASE=http://localhost:8000/v1
 export OPENAI_API_KEY=sk-local
-aider --model openai/qwen3.8-27b
+aider --model openai/qwen3.8-flash-next
 ```
 
 ## Browser chat (Open WebUI)
@@ -388,7 +389,7 @@ reconstruct from those.
 
 ## Cline / Roo Code / Continue (VS Code)
 
-Provider **OpenAI Compatible** → Base URL `http://localhost:8000/v1`, any API key, model `qwen3.8-27b`.
+Provider **OpenAI Compatible** → Base URL `http://localhost:8000/v1`, any API key, model `qwen3.8-flash-next`.
 Tool calling is enabled server-side (`qwen3_xml` parser), so agentic edit/apply flows work.
 
 ## Claude Code
@@ -409,6 +410,21 @@ messages=[{"role": "user", "content": [
 ```
 
 ---
+
+## Agents (the workbench at localhost:8090)
+
+Tunnel port 8090 and open http://localhost:8090. Each session is [Pi](https://pi.dev) with the lab profile
+(github.com/GusEllerm/pi-lab-profile: subagent fleet, `/round` reviews, endpoint probes), running in a terminal in
+your browser. All of your sessions share one Slurm job on the compute nodes, which runs as your agent account
+and is sized when it starts (default 4 CPUs, 16 GB; an idle session costs ~170 MB, so CPUs are the real limit: plan
+1-2 per agent that is building or testing). The model calls go through the same fair share as everyone else's, with
+a key the workbench sets up for you.
+
+- Sessions keep running when you close the page. Quitting Pi in its terminal stops that session; "resume" brings
+  back the same conversation. The job renews itself at the 2-day limit and your sessions come back by themselves;
+  with nothing running for 30 minutes it ends, and the next session starts a new one.
+- The working directory is inside the agent account's home (`~/...`). Agents act with that account's permissions,
+  so treat what you ask them to run accordingly.
 
 ## Etiquette and fairness
 

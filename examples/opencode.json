@@ -9,8 +9,8 @@
         "apiKey": "sk-local"
       },
       "models": {
-        "qwen3.8-27b": {
-          "name": "Qwen3.8 27B",
+        "qwen3.8-flash-next": {
+          "name": "Qwen3.8 Flash-Next",
           "tool_call": true,
           "reasoning": true,
           "attachment": true,
@@ -22,6 +22,6 @@
       }
     }
   },
-  "model": "globus/qwen3.8-27b",
-  "small_model": "globus/qwen3.8-27b"
+  "model": "globus/qwen3.8-flash-next",
+  "small_model": "globus/qwen3.8-flash-next"
 }

@@ -13,6 +13,9 @@
 set -uo pipefail
 FN_HOME=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 . "$FN_HOME/etc/fn.env"
+# The nightly tree (qwen4_exp) carries its own fixes for 1 and 4, has no anchor for 5, and PR #54846
+# (in the overlay) covers 7: skip those unless the caller set FN_SKIP_PATCHES explicitly.
+if [ "$FN_MODEL_PKG" = qwen4_exp ] && [ -z "${FN_SKIP_PATCHES+x}" ]; then FN_SKIP_PATCHES="1 4 5 7"; fi
 mkdir -p "$FN_LOGS"
 
 RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; DIM=$'\e[2m'; OFF=$'\e[0m'
@@ -26,10 +29,11 @@ say ()  { echo; echo "== $* =="; }
 on_node () {
   if [ "$(hostname)" = "$FN_NODE" ]; then bash -c "$*"; return $?; fi
   # Any of our jobs already on the node will do — overlap into it rather than
-  # queueing behind ourselves (a --mem=0 job holds the whole node).
+  # queueing behind ourselves (a --mem=0 job holds the whole node). -w matters: a multi-node
+  # job (TP2 serve, NCCL test) also matches, and without it the step lands on its FIRST node.
   local J; J=$(squeue -h -u "$USER" -t R -w "$FN_NODE" -o "%i" 2>/dev/null | head -1)
   if [ -n "$J" ]; then
-    srun --jobid="$J" --overlap -n1 --mem=4G --cpus-per-task=2 -t 30 bash -c "$*"
+    srun --jobid="$J" --overlap -w "$FN_NODE" -n1 --mem=4G --cpus-per-task=2 -t 30 bash -c "$*"
   else
     srun -p "$FN_PARTITION" -w "$FN_NODE" -n1 --mem=8G --cpus-per-task=4 -t 30 bash -c "$*"
   fi
@@ -76,16 +80,24 @@ open('$FN_SCRATCH/layers.txt','w').write('\n'.join(l['digest'] for l in d['layer
   "
 }
 
+stage_overlay () {
+  [ "$FN_MODEL_PKG" = qwen4_exp ] || { ok "no overlay for $FN_MODEL_PKG"; return 0; }
+  on_node "[ -f '$FN_SP/.fn-patches/overlay' ]" >/dev/null 2>&1 && { ok "overlay applied (marker present; fn build --force re-applies)"; return 0; }
+  on_node "SP='$FN_SP' FN_HOME='$FN_HOME' MODPKG='$FN_MODEL_PKG' bash '$FN_HOME/bin/apply-overlay.sh'"
+}
+
 stage_patches () {
   on_node "FN_HOME='$FN_HOME' SP='$FN_SP' REPO='$FN_HOME/flash-dgx' MODPKG='$FN_MODEL_PKG' \
-           KDET='$FN_KDET_URL' KDETDIR='$FN_KDET' bash '$FN_HOME/bin/apply-patches.sh'"
+           KDET='$FN_KDET_URL' KDETDIR='$FN_KDET' SKIP='${FN_SKIP_PATCHES:-}' bash '$FN_HOME/bin/apply-patches.sh'"
 }
 
 stage_kernel () {
-  on_node "[ -f '$FN_KDET/_C_det.so' ]" >/dev/null 2>&1 && { ok "det-topk kernel already built"; return 0; }
+  # Done means BOTH the binary and the wiring (patch 8 marker): an earlier run can build the
+  # .so and then fail the anchor, and must not be mistaken for finished.
+  on_node "[ -f '$FN_KDET/_C_det.so' ] && [ -f '$FN_SP/.fn-patches/8' ]" >/dev/null 2>&1 && { ok "det-topk kernel built and wired"; return 0; }
   on_node_gpu "FN_HOME='$FN_HOME' SP='$FN_SP' REPO='$FN_HOME/flash-dgx' MODPKG='$FN_MODEL_PKG' \
                KDET='$FN_KDET_URL' KDETDIR='$FN_KDET' DET_ARCH='$FN_DET_ARCH' \
-               BUILD_KERNEL=1 bash '$FN_HOME/bin/apply-patches.sh'"
+               BUILD_KERNEL=1 SKIP='${FN_SKIP_PATCHES:-}' bash '$FN_HOME/bin/apply-patches.sh'"
 }
 
 stage_weights () {
@@ -119,6 +131,25 @@ stage_hybrid () {
   "
 }
 
+stage_tp2 () {
+  # Tensor parallel 2 cannot use the hybrid checkpoint as is: the shared expert is 640 wide, 320 per rank, which is
+  # not a multiple of the 128x128 FP8 block. Same conversion with the shared expert left bf16 (0.24 GiB per rank).
+  [ "$FN_MODE" = hybrid ] || { ok "mode=$FN_MODE, no tp2 conversion needed"; return 0; }
+  local S; S=$(snap_base); [ -n "$S" ] || { warn "no checkpoint yet; run build again after the download"; return 1; }
+  on_node "
+    S='$S'; D=\"\${S}-fp8hybrid-tp2\"
+    [ -f \"\$D/.prepared\" ] && { echo '  tp2 checkpoint already prepared'; exit 0; }
+    set -e
+    rm -rf \"\$D\"; cp -a \"\$S\" \"\$D\"
+    cp --remove-destination \"\$(readlink -f \"\$D/model.safetensors.index.json\")\" \"\$D/model.safetensors.index.json\"
+    PYTHONPATH='$FN_SP' PYTHONNOUSERSITE=1 python3.12 '$FN_HOME/bin/fp8_convert_tp2.py' \"\$D\" \\
+      | tee \"\$D/fp8_convert.log\" | tail -3
+    grep -q '^done. worst per-tensor' \"\$D/fp8_convert.log\"
+    chmod 644 \"\$D\"/*.safetensors \"\$D\"/model.safetensors.index.json
+    touch \"\$D/.prepared\"
+  "
+}
+
 cmd_build () {
   [ "${1:-}" = "--force" ] && { echo "forcing: clearing patch markers"; on_node "rm -rf '$FN_SP/.fn-patches'"; }
   # Later stages are still worth attempting after an early failure (the weights
@@ -126,12 +157,14 @@ cmd_build () {
   # than bailing -- but never report success when one of them failed.
   local failed=()
   run_stage () { local label=$1; say "$label"; shift; "$@" || failed+=("$label"); }
-  run_stage "1/6 patch sources"        stage_repo
-  run_stage "2/6 official image"       stage_image
-  run_stage "3/6 patch stack"          stage_patches
-  run_stage "4/6 deterministic kernel" stage_kernel
-  run_stage "5/6 checkpoint"           stage_weights
-  run_stage "6/6 hybrid conversion"    stage_hybrid
+  run_stage "1/8 patch sources"        stage_repo
+  run_stage "2/8 official image"       stage_image
+  run_stage "3/8 PLE overlay"          stage_overlay
+  run_stage "4/8 patch stack"          stage_patches
+  run_stage "5/8 deterministic kernel" stage_kernel
+  run_stage "6/8 checkpoint"           stage_weights
+  run_stage "7/8 hybrid conversion"    stage_hybrid
+  run_stage "8/8 tp2 checkpoint"       stage_tp2
   echo
   if [ ${#failed[@]} -gt 0 ]; then
     echo "build INCOMPLETE: ${#failed[@]} stage(s) failed: ${failed[*]}"
@@ -146,7 +179,7 @@ cmd_verify () {
   FAILED=0
   say "verify (content checks, not stamps)"
   on_node "SP='$FN_SP' MODPKG='$FN_MODEL_PKG' KDETDIR='$FN_KDET' FN_HF='$FN_HF' \
-           FN_MODEL='$FN_MODEL' MODE='$FN_MODE' bash '$FN_HOME/bin/verify.sh'"
+           FN_MODEL='$FN_MODEL' MODE='$FN_MODE' SKIP='${FN_SKIP_PATCHES:-}' bash '$FN_HOME/bin/verify.sh'"
   FAILED=$?
   echo
   [ "$FAILED" = 0 ] && echo "${GRN}all checks passed${OFF}" || echo "${RED}$FAILED check(s) failed — run: fn build${OFF}"

@@ -31,7 +31,7 @@ import urllib.request
 
 __all__ = ["get_access_token", "get_client", "BASE_URL", "MODEL", "EndpointDown"]
 
-MODEL = "qwen3.8-27b"
+MODEL = "qwen3.8-flash-next"
 DEFAULT_PORT = int(os.environ.get("GLOBUS_LLM_PORT", "8000"))
 BASE_URL = os.environ.get("OPENAI_BASE_URL", f"http://localhost:{DEFAULT_PORT}/v1")
 
