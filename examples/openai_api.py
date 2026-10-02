@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Using the globus Qwen3.8-27B endpoint from your own code.
+"""Using the globus Qwen3.8-Flash-Next endpoint from your own code.
 
 It is a plain OpenAI-compatible server, so this is the same shape as the ALCF inference
 service — only the base_url changes. If you already have code written against ALCF, you
@@ -19,7 +19,7 @@ import os
 from openai import OpenAI
 
 BASE = os.environ.get("OPENAI_BASE_URL", "http://localhost:8000/v1")
-MODEL = "qwen3.8-27b"
+MODEL = "qwen3.8-flash-next"
 
 # api_key is required by the client library but ignored by the server: reaching the
 # endpoint at all means you came through an authenticated SSH tunnel.

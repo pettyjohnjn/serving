@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# llm-tunnel — open a local OpenAI-compatible endpoint backed by the Qwen3.8-27B
+# llm-tunnel — open a local OpenAI-compatible endpoint backed by the Qwen3.8-Flash-Next
 # server on the globus cluster. Your SSH key is the credential; there is nothing
 # else to configure.
 #

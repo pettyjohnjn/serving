@@ -60,6 +60,8 @@ node_main () {
   [ -d "$SP/nvidia_cutlass_dsl/dsl_packages" ] && export PYTHONPATH="$PYTHONPATH:$SP/nvidia_cutlass_dsl/dsl_packages"
   export HF_HOME=$FN_HF HF_HUB_OFFLINE=1
   export VLLM_FP8_HYBRID=1 VLLM_USE_DEEP_GEMM=0 VLLM_QSA_EXACT_TOPK=0 VLLM_USE_FLASHINFER_SAMPLER=1
+  # Privacy/security: no usage stats to stats.vllm.ai (on by default), no redirects when resolving media.
+  export VLLM_NO_USAGE_STATS=1 VLLM_DO_NOT_TRACK=1 VLLM_MEDIA_URL_ALLOW_REDIRECTS=0
   # The deterministic top-k kernel is required: without it, concurrent cold prefills wedge the engine.
   export VLLM_QSA_DET_TOPK=1 VLLM_QSA_DET_LIB=$FN_SCRATCH/kernel-det/_C_det.so
   case "$PLE_MODE" in
@@ -91,6 +93,9 @@ node_main () {
     --no-enable-flashinfer-autotune
     --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3
     --limit-mm-per-prompt '{"image":4,"video":0}'
+    # /tokenize and other routes are unauthenticated and resolve image_url: block remote media entirely (inline
+    # base64 data: images still work), no docs pages, no cross-origin browser access.
+    --allowed-media-domains blocked.invalid --disable-fastapi-docs --allowed-origins '[]'
     --default-chat-template-kwargs '{"reasoning_effort":"medium"}'
     # disable_eagle_block_drop: without it this vLLM disables prefix reuse for the Mamba groups under MTP.
     --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$MTP,\"disable_eagle_block_drop\":true}"

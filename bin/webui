@@ -36,7 +36,7 @@ PROXY_PORT=8080                # what users tunnel to
 alive()  { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
 
 # Three small patches to the installed package, re-applied on every start so a pip
-# upgrade cannot silently revert them (same idea as patch_vllm_gdn_sm120.sh):
+# upgrade cannot silently revert them:
 #   1. drop the " (Open WebUI)" suffix env.py forces onto a custom WEBUI_NAME;
 #   2. bump the frontend root font size — the UI is rem-based, so this scales
 #      everything (users can still fine-tune with browser zoom);

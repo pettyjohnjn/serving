@@ -93,7 +93,8 @@ for l in lines[start:]:
     flags.update(re.findall(r"--[a-z0-9-]+", code))
     if depth <= 0:
         break
-for required in ("--served-model-name", "--enable-prefix-caching", "--speculative-config"):
+for required in ("--served-model-name", "--enable-prefix-caching", "--speculative-config",
+                 "--allowed-media-domains", "--disable-fastapi-docs", "--allowed-origins"):
     if required not in flags:
         sys.exit(f"lint: {required} never reaches vllm (array truncated?)")
 text = "\n".join(lines)
@@ -101,6 +102,9 @@ if not re.search(r'ARGS\+=\(--host 127\.0\.0\.1 --port', text):
     sys.exit("lint: the head node no longer binds 127.0.0.1")
 if not re.search(r'serve "\$\{ARGS\[@\]\}"', text):
     sys.exit("lint: ARGS is assembled but never executed")
+for env in ("VLLM_NO_USAGE_STATS=1", "VLLM_DO_NOT_TRACK=1", "VLLM_MEDIA_URL_ALLOW_REDIRECTS=0"):
+    if env not in text:
+        sys.exit(f"lint: {env} missing (telemetry / media redirects)")
 if "0.0.0.0" in re.sub(r"#.*", "", text):
     sys.exit("lint: 0.0.0.0 appears in serve.sbatch")
 PYEOF

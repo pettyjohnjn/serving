@@ -8,7 +8,7 @@ Diff from the ALCF original is two lines — the import and the base_url:
     - base_url="https://inference-api.alcf.anl.gov/resource_server/minerva/api/v1",
     + base_url=BASE_URL,
 
-and the model name (`inkling-bf16` -> `qwen3.8-27b`).
+and the model name (`inkling-bf16` -> `qwen3.8-flash-next`).
 
 Run it with the tunnel up:
     ssh -N -L 8000:127.0.0.1:8000 globus1
@@ -24,13 +24,13 @@ client = OpenAI(
 )
 
 r = client.chat.completions.create(
-    model="qwen3.8-27b",
+    model="qwen3.8-flash-next",
     messages=[{"role": "user", "content": "Reply with just: ok"}],
 )
 print(r.choices[0].message.content)
 
 r = client.chat.completions.create(
-    model="qwen3.8-27b",
+    model="qwen3.8-flash-next",
     messages=[{"role": "user", "content": "What files are in /tmp? Use the tool."}],
     tools=[{
         "type": "function",
