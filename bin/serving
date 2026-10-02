@@ -408,6 +408,6 @@ case "${1:-status}" in
     install)   shift; cmd_install ;;
     uninstall) shift; cmd_uninstall ;;
     services)  shift; cmd_services "$@" ;;
-    -h|--help|help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' ;;
+    -h|--help|help) awk 'NR>1 && !/^#/ {exit} NR>1' "$0" | sed 's/^# \{0,1\}//' ;;
     *) die "unknown command '$1' (try: serving help)" ;;
 esac
