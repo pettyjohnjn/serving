@@ -26,7 +26,7 @@ TARGETS = re.compile(
     r"model\.language_model\.layers\.\d+\.("
     r"linear_attn\.(in_proj_qkv|in_proj_z|out_proj)"
     r"|self_attn\.(q_proj|k_proj|v_proj|o_proj)"
-    # spark56 TP2: shared expert (640 wide) stays bf16; 320 per rank is not a multiple of the 128 block
+    # TP2: the shared expert (640 wide) stays bf16; 320 per rank is not a multiple of the 128 block
     r")\.weight$"
 )
 
