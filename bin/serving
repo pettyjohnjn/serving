@@ -12,6 +12,7 @@
 #   serving doctor         diagnose a broken or unreachable endpoint
 #   serving supervise      cron: keep the login services up, resubmit the engine if it should run and does not
 #   serving install        one-time: authorize the tunnel key, install the cron line, start the services
+#   serving uninstall      reverse of install, plus stop the engine: frees every port for another account
 #   serving services start|stop|restart|status [fair-proxy|webui|dashboard|all]
 #
 # Login-node services (as this account): fair-proxy on 127.0.0.1:8000 (users by account) and
@@ -383,6 +384,17 @@ cmd_install() {
     cmd_services start
 }
 
+cmd_uninstall() {
+    cmd_stop
+    cmd_services stop
+    ( crontab -l 2>/dev/null | grep -v '# serving$' ) | crontab -
+    local auth=$HOME/.ssh/authorized_keys
+    if [ -f "$auth" ]; then cp "$auth" "$auth.bak.$(date +%s)"; grep -v " llm-reverse-tunnel\$" "$auth" > "$auth.tmp"
+        mv "$auth.tmp" "$auth"; chmod 600 "$auth"; fi
+    info "uninstalled: engine stopped, services stopped, cron line and tunnel key line removed"
+    info "(state/, webui-data/ and logs/ are kept; agent host jobs end on their own after 30 idle minutes)"
+}
+
 case "${1:-status}" in
     start)     shift; cmd_start ;;
     stop)      shift; cmd_stop ;;
@@ -394,7 +406,8 @@ case "${1:-status}" in
     doctor)    shift; cmd_doctor ;;
     supervise) shift; cmd_supervise ;;
     install)   shift; cmd_install ;;
+    uninstall) shift; cmd_uninstall ;;
     services)  shift; cmd_services "$@" ;;
-    -h|--help|help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
+    -h|--help|help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) die "unknown command '$1' (try: serving help)" ;;
 esac
